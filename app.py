@@ -18,13 +18,38 @@ Models:
 
 from flask import Flask, render_template, request, jsonify
 import requests
-import json, os, math
+import json, os, math, time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = 'matchiq-pro-2024'
 API_KEY_FILE = 'api_key.txt'
+
+# ─── In-memory cache (survives within a single server session) ───────────────
+_cache = {}
+CACHE_TTL = 3600  # 1 hour
+
+# ─── Rate limit tracker ───────────────────────────────────────────────────────
+_rate = {
+    'limit': 10,          # requests allowed per window
+    'remaining': 10,      # requests left this window
+    'reset_at': 0,        # unix timestamp when window resets
+    'used_this_window': 0,
+}
+
+def cache_get(key):
+    if key in _cache:
+        val, ts = _cache[key]
+        if time.time() - ts < CACHE_TTL:
+            app.logger.info(f'Cache HIT: {key}')
+            return val
+        else:
+            del _cache[key]
+    return None
+
+def cache_set(key, val):
+    _cache[key] = (val, time.time())
 
 # ─── API helpers ────────────────────────────────────────────────────────────
 
@@ -41,49 +66,79 @@ def save_api_key(key):
     with open(API_KEY_FILE, 'w') as f:
         f.write(key.strip())
 
-def fd(endpoint, api_key, params=None, retries=2):
-    """Fetch from football-data.org with retry on rate limit."""
-    import time
-    for attempt in range(retries + 1):
-        try:
-            r = requests.get(
+def fd(endpoint, api_key, params=None, use_cache=True):
+    """Fetch from football-data.org with caching to minimize API calls."""
+    cache_key = f'{endpoint}_{json.dumps(params or {}, sort_keys=True)}'
+
+    if use_cache:
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+    try:
+        r = requests.get(
+            f'https://api.football-data.org/v4/{endpoint}',
+            headers={'X-Auth-Token': api_key},
+            params=params or {},
+            timeout=15
+        )
+        app.logger.info(f'GET {endpoint} -> {r.status_code}')
+
+        # Capture rate limit headers from every response
+        def parse_rate_headers(resp):
+            try:
+                remaining = resp.headers.get('X-RequestCounter-Remaining')
+                reset = resp.headers.get('X-RequestCounter-Reset')
+                limit = resp.headers.get('X-Requests-Available-Minute')
+                if remaining is not None:
+                    _rate['remaining'] = int(remaining)
+                if reset is not None:
+                    _rate['reset_at'] = time.time() + int(reset)
+                if limit is not None:
+                    _rate['limit'] = int(limit)
+                _rate['used_this_window'] = _rate['limit'] - _rate['remaining']
+            except Exception:
+                pass
+
+        if r.status_code == 200:
+            parse_rate_headers(r)
+            data = r.json()
+            if use_cache:
+                cache_set(cache_key, data)
+            return data
+        elif r.status_code == 429:
+            parse_rate_headers(r)
+            reset = int(r.headers.get('X-RequestCounter-Reset', 61))
+            app.logger.warning(f'Rate limited on {endpoint}, waiting {min(reset,65)}s')
+            time.sleep(min(reset, 65))
+            r2 = requests.get(
                 f'https://api.football-data.org/v4/{endpoint}',
                 headers={'X-Auth-Token': api_key},
                 params=params or {},
                 timeout=15
             )
-            app.logger.info(f'GET {endpoint} -> {r.status_code}')
-            if r.status_code == 200:
-                return r.json()
-            elif r.status_code == 429:
-                app.logger.warning(f'Rate limited on {endpoint} (attempt {attempt+1}) — skipping')
-                # Never block the worker waiting for rate limit reset
-                return None
-            elif r.status_code == 403:
-                app.logger.error(f'403 on {endpoint}: access denied')
-                return None
-            elif r.status_code == 400:
-                app.logger.error(f'400 on {endpoint}: bad request — {r.text[:200]}')
-                return None
-            elif r.status_code == 404:
-                app.logger.error(f'404 on {endpoint}: not found')
-                return None
-            else:
-                app.logger.error(f'{r.status_code} on {endpoint}: {r.text[:200]}')
-                if attempt < retries:
-                    time.sleep(5)
-                    continue
-                return None
-        except requests.exceptions.Timeout:
-            app.logger.error(f'Timeout on {endpoint} (attempt {attempt+1})')
-            if attempt < retries:
-                time.sleep(3)
-                continue
+            if r2.status_code == 200:
+                parse_rate_headers(r2)
+                data = r2.json()
+                if use_cache:
+                    cache_set(cache_key, data)
+                return data
             return None
-        except Exception as e:
-            app.logger.error(f'Exception on {endpoint}: {e}')
+        elif r.status_code == 403:
+            app.logger.error(f'403 on {endpoint}: access denied')
             return None
-    return None
+        elif r.status_code == 404:
+            app.logger.error(f'404 on {endpoint}: not found')
+            return None
+        else:
+            app.logger.error(f'{r.status_code} on {endpoint}: {r.text[:200]}')
+            return None
+    except requests.exceptions.Timeout:
+        app.logger.error(f'Timeout on {endpoint}')
+        return None
+    except Exception as e:
+        app.logger.error(f'Exception on {endpoint}: {e}')
+        return None
 
 # ─── Global error handlers ───────────────────────────────────────────────────
 
@@ -128,6 +183,18 @@ def save_key():
         return jsonify({'error': 'Invalid or unauthorised API key — check your token at football-data.org'}), 400
     save_api_key(key)
     return jsonify({'success': True})
+
+@app.route('/api/rate-status')
+def rate_status():
+    now = time.time()
+    reset_in = max(0, round(_rate['reset_at'] - now)) if _rate['reset_at'] else 60
+    return jsonify({
+        'limit': _rate['limit'],
+        'remaining': _rate['remaining'],
+        'used': _rate['used_this_window'],
+        'reset_in': reset_in,
+        'pct_used': round((_rate['limit'] - _rate['remaining']) / max(_rate['limit'], 1) * 100),
+    })
 
 @app.route('/api/competitions')
 def get_competitions():
@@ -190,71 +257,73 @@ def analyze():
 
 # ─── Data Collection ─────────────────────────────────────────────────────────
 
+def get_comp_code(comp_id, key):
+    """Get competition code (e.g. 'PL') for a given ID. API filters use CODE not ID."""
+    cached = cache_get(f'comp_code_{comp_id}')
+    if cached:
+        return cached
+    data = fd(f'competitions/{comp_id}', key)
+    if data:
+        code = data.get('code', '')
+        cache_set(f'comp_code_{comp_id}', code)
+        return code
+    return None
+
 def collect_team_data(team_id, comp_id, key):
     """Fetch last 10 league matches with full stats + lineups."""
-    import time
-
     app.logger.info(f'Fetching matches for team {team_id} in comp {comp_id}')
 
-    # Strategy 1: filtered by competition
-    matches_raw = fd(f'teams/{team_id}/matches', key, {
-        'competitions': comp_id, 'status': 'FINISHED', 'limit': 15
-    })
-    all_matches = (matches_raw or {}).get('matches') or []
-    app.logger.info(f'Strategy 1 (filtered): got {len(all_matches)} matches')
+    # Per API docs: competitions filter uses CODE (e.g. PL) not numeric ID
+    comp_code = get_comp_code(comp_id, key)
+    app.logger.info(f'Competition code resolved: {comp_code}')
 
-    # Strategy 2: no competition filter, higher limit
+    # Strategy 1: filter by competition CODE
+    params = {'status': 'FINISHED', 'limit': 15}
+    if comp_code:
+        params['competitions'] = comp_code
+    matches_raw = fd(f'teams/{team_id}/matches', key, params)
+    all_matches = (matches_raw or {}).get('matches') or []
+    app.logger.info(f'Strategy 1 (code={comp_code}): {len(all_matches)} matches')
+
+    # Strategy 2: unfiltered, filter locally
     if len(all_matches) < 3:
-        app.logger.warning(f'Strategy 1 got {len(all_matches)} — trying unfiltered')
-        matches_raw2 = fd(f'teams/{team_id}/matches', key, {
-            'status': 'FINISHED', 'limit': 30
-        })
+        matches_raw2 = fd(f'teams/{team_id}/matches', key, {'status': 'FINISHED', 'limit': 40})
         all_matches2 = (matches_raw2 or {}).get('matches') or []
-        app.logger.info(f'Strategy 2 (unfiltered): got {len(all_matches2)} matches')
-        # Filter locally by competition id
+        app.logger.info(f'Strategy 2 (unfiltered): {len(all_matches2)} matches')
+
         comp_filtered = [m for m in all_matches2
-                         if str((m.get('competition') or {}).get('id', '')) == str(comp_id)
-                         and (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
+            if (str((m.get('competition') or {}).get('id', '')) == str(comp_id) or
+                (m.get('competition') or {}).get('code', '') == comp_code)
+            and (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
         app.logger.info(f'Strategy 2 comp-filtered: {len(comp_filtered)} matches')
+
         if len(comp_filtered) >= 3:
             all_matches = comp_filtered
-        elif len(all_matches2) >= 3:
-            # Use all finished matches regardless of competition as last resort
+        elif all_matches2:
             all_matches = [m for m in all_matches2
-                           if (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
-            app.logger.warning(f'Using cross-competition fallback: {len(all_matches)} matches')
+                if (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
+            app.logger.warning(f'Cross-comp fallback: {len(all_matches)} matches')
 
     if not all_matches:
-        return {'error': f'Cannot fetch matches for team {team_id}. API returned no data — wait 60 seconds and try again.'}
+        return {'error': f'No match data for team {team_id}. Possible rate limit — wait 60s and retry.'}
 
-    # Filter to finished matches with scores
     finished = [m for m in all_matches
                 if (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
     matches = finished[-10:]
 
     if len(matches) < 3:
-        return {'error': f'Only {len(matches)} finished matches found for team {team_id}. Need at least 3 to analyse.'}
-
+        return {'error': f'Only {len(matches)} finished matches found for team {team_id}. Need at least 3.'}
     # Enrich with detailed match data (lineup + stats per match)
-    # Use a short delay between calls to avoid hitting the 10 req/min free tier limit
+    # Uses cache so repeated analyses don't re-fetch the same matches
     enriched = []
     for m in matches:
-        time.sleep(0.7)  # ~8 requests/min safely under the 10/min limit
-        try:
-            r = requests.get(
-                f'https://api.football-data.org/v4/matches/{m["id"]}',
-                headers={'X-Auth-Token': key},
-                timeout=10
-            )
-            if r.status_code == 200:
-                enriched.append(r.json())
-            else:
-                # Rate limited or error — just use basic match data, don't block
-                app.logger.warning(f'Skipping detail for match {m["id"]}: {r.status_code}')
-                enriched.append(m)
-        except Exception as e:
-            app.logger.warning(f'Detail fetch failed for match {m["id"]}: {e}')
+        detail = fd(f'matches/{m["id"]}', key, use_cache=True)
+        if detail:
+            enriched.append(detail)
+        else:
+            app.logger.warning(f'Using basic data for match {m["id"]}')
             enriched.append(m)
+        time.sleep(0.3)  # small polite delay between calls
 
     # Get team name from matches
     team_name = ''
@@ -368,9 +437,8 @@ def parse_team_stats(team_id, matches, team_name, short_name):
         if formation:
             formations.append(formation)
 
-        # Player appearances
-        lineup = my_team.get('lineup', [])
-        bench = my_team.get('bench', [])
+        # Player appearances from lineup
+        lineup = my_team.get('lineup') or []
         for player in lineup:
             pid = player.get('id')
             if pid:
@@ -379,6 +447,21 @@ def parse_team_stats(team_id, matches, team_name, short_name):
                 pos = player.get('position', '')
                 if pos:
                     player_apps[pid]['positions'].add(pos)
+
+        # Goals and assists from the goals array (per API docs)
+        for goal in (m.get('goals') or []):
+            goal_team_id = (goal.get('team') or {}).get('id')
+            if goal_team_id == team_id:
+                scorer_id = (goal.get('scorer') or {}).get('id')
+                assist_id = (goal.get('assist') or {}).get('id')
+                if scorer_id:
+                    player_apps[scorer_id]['goals'] = player_apps[scorer_id].get('goals', 0) + 1
+                    if not player_apps[scorer_id]['name']:
+                        player_apps[scorer_id]['name'] = (goal.get('scorer') or {}).get('name', '')
+                if assist_id:
+                    player_apps[assist_id]['assists'] = player_apps[assist_id].get('assists', 0) + 1
+                    if not player_apps[assist_id]['name']:
+                        player_apps[assist_id]['name'] = (goal.get('assist') or {}).get('name', '')
 
         result_row = {
             'date': m.get('utcDate','')[:10],
@@ -407,9 +490,13 @@ def parse_team_stats(team_id, matches, team_name, short_name):
 
     # Likely starting 11 = players with most appearances
     sorted_players = sorted(player_apps.values(), key=lambda x: -x['appearances'])
-    likely_xi = [{'name': p['name'], 'appearances': p['appearances'],
-                  'position': list(p['positions'])[0] if p['positions'] else 'Unknown'}
-                 for p in sorted_players[:11]]
+    likely_xi = [{
+        'name': p['name'],
+        'appearances': p['appearances'],
+        'position': list(p['positions'])[0] if p['positions'] else 'Unknown',
+        'goals': p.get('goals', 0),
+        'assists': p.get('assists', 0),
+    } for p in sorted_players[:11]]
 
     # Shot-based xG proxy: 0.1 per shot on target (rough but widely used proxy)
     shot_xg = round(w_shots / total_w * 0.12, 3)
@@ -471,29 +558,54 @@ def parse_team_stats(team_id, matches, team_name, short_name):
     }
 
 def get_head_to_head(team_a, team_b, key):
-    """Get H2H via a recent match between them and use head2head subresource."""
-    # Try fetching via matches resource with both teams
-    # Best available: fetch both teams' recent matches and look for common ones
-    data = fd(f'teams/{team_a}/matches', key, {
-        'limit': 30, 'status': 'FINISHED'
-    })
-    if not data:
-        return {'matches': [], 'total': 0, 'home_wins': 0, 'draws': 0, 'away_wins': 0}
+    """Use the official /head2head subresource from the API docs."""
+    # First find a recent match ID between these two teams
+    data = fd(f'teams/{team_a}/matches', key, {'status': 'FINISHED', 'limit': 40})
+    matches = (data or {}).get('matches') or []
+
+    match_id = None
+    for m in reversed(matches):
+        ht_id = (m.get('homeTeam') or {}).get('id')
+        at_id = (m.get('awayTeam') or {}).get('id')
+        if {ht_id, at_id} == {team_a, team_b}:
+            match_id = m.get('id')
+            break
 
     h2h_matches = []
-    for m in (data.get('matches') or []):
-        ht_id = m.get('homeTeam', {}).get('id')
-        at_id = m.get('awayTeam', {}).get('id')
-        if {ht_id, at_id} == {team_a, team_b}:
-            ft = m.get('score', {}).get('fullTime', {})
-            hs = ft.get('home'); aws = ft.get('away')
-            if hs is not None:
-                h2h_matches.append({
-                    'date': m.get('utcDate','')[:10],
-                    'home_team': m.get('homeTeam',{}).get('shortName',''),
-                    'away_team': m.get('awayTeam',{}).get('shortName',''),
-                    'home_score': hs, 'away_score': aws
-                })
+    if match_id:
+        # Use the official head2head subresource
+        h2h_data = fd(f'matches/{match_id}/head2head', key, {'limit': 10})
+        if h2h_data:
+            for m in (h2h_data.get('matches') or []):
+                ft = (m.get('score') or {}).get('fullTime') or {}
+                hs = ft.get('home')
+                aws = ft.get('away')
+                if hs is not None:
+                    h2h_matches.append({
+                        'date': m.get('utcDate', '')[:10],
+                        'home_team': (m.get('homeTeam') or {}).get('shortName', ''),
+                        'away_team': (m.get('awayTeam') or {}).get('shortName', ''),
+                        'home_score': hs,
+                        'away_score': aws,
+                    })
+
+    # Fallback: scan team matches manually
+    if not h2h_matches:
+        for m in matches:
+            ht_id = (m.get('homeTeam') or {}).get('id')
+            at_id = (m.get('awayTeam') or {}).get('id')
+            if {ht_id, at_id} == {team_a, team_b}:
+                ft = (m.get('score') or {}).get('fullTime') or {}
+                hs = ft.get('home')
+                aws = ft.get('away')
+                if hs is not None:
+                    h2h_matches.append({
+                        'date': m.get('utcDate', '')[:10],
+                        'home_team': (m.get('homeTeam') or {}).get('shortName', ''),
+                        'away_team': (m.get('awayTeam') or {}).get('shortName', ''),
+                        'home_score': hs,
+                        'away_score': aws,
+                    })
 
     hw = sum(1 for m in h2h_matches if m['home_score'] > m['away_score'])
     dr = sum(1 for m in h2h_matches if m['home_score'] == m['away_score'])
