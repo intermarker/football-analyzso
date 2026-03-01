@@ -42,6 +42,7 @@ def save_api_key(key):
         f.write(key.strip())
 
 def fd(endpoint, api_key, params=None):
+    """Fetch from football-data.org. Returns dict on success, None on failure."""
     try:
         r = requests.get(
             f'https://api.football-data.org/v4/{endpoint}',
@@ -49,12 +50,18 @@ def fd(endpoint, api_key, params=None):
             params=params or {},
             timeout=15
         )
+        app.logger.info(f'GET {endpoint} -> {r.status_code}')
         if r.status_code == 200:
             return r.json()
-        app.logger.error(f'API {endpoint} returned {r.status_code}: {r.text[:200]}')
+        if r.status_code == 403:
+            app.logger.error(f'403 on {endpoint}: tier restriction')
+        elif r.status_code == 429:
+            app.logger.error(f'429 on {endpoint}: rate limit')
+        else:
+            app.logger.error(f'{r.status_code} on {endpoint}: {r.text[:200]}')
         return None
     except Exception as e:
-        app.logger.error(f'API {endpoint} exception: {e}')
+        app.logger.error(f'Exception on {endpoint}: {e}')
         return None
 
 # ─── Routes ─────────────────────────────────────────────────────────────────
@@ -98,7 +105,7 @@ def get_teams(comp_id):
     key = get_api_key()
     data = fd(f'competitions/{comp_id}/teams', key)
     if not data:
-        return jsonify({'error': 'Failed'}), 500
+        return jsonify({'error': 'Cannot load teams for this competition. Your API subscription tier may not support it. Please select Premier League, Bundesliga, La Liga, Serie A, Ligue 1, or Champions League.'}), 403
     teams = [{'id': t['id'], 'name': t['name'], 'shortName': t.get('shortName', t['name']),
                'crest': t.get('crest','')} for t in data.get('teams', [])]
     return jsonify(sorted(teams, key=lambda x: x['name']))
@@ -136,42 +143,49 @@ def analyze():
 # ─── Data Collection ─────────────────────────────────────────────────────────
 
 def collect_team_data(team_id, comp_id, key):
-    """Fetch last 10 league matches with full stats + lineups, squad, scorers."""
-    matches_raw = fd(f'teams/{team_id}/matches', key, {
-        'competitions': comp_id, 'status': 'FINISHED', 'limit': 12
-    })
-    if not matches_raw:
-        return {'error': f'Cannot fetch matches for team {team_id}'}
+    """Fetch last 10 league matches with full stats + lineups."""
+    import time
 
-    matches = [m for m in matches_raw.get('matches', [])
-               if m.get('score', {}).get('fullTime', {}).get('home') is not None][-10:]
+    # Try with competition filter first
+    matches_raw = fd(f'teams/{team_id}/matches', key, {
+        'competitions': comp_id, 'status': 'FINISHED', 'limit': 15
+    })
+
+    # Fallback: fetch without competition filter (works on free tier)
+    if not matches_raw:
+        app.logger.warning(f'Filtered fetch failed for team {team_id}, trying unfiltered')
+        matches_raw = fd(f'teams/{team_id}/matches', key, {
+            'status': 'FINISHED', 'limit': 20
+        })
+
+    if not matches_raw:
+        return {'error': f'Cannot fetch matches for team {team_id}. This competition may not be available on your API tier. Supported competitions: Premier League, Bundesliga, La Liga, Serie A, Ligue 1, Champions League, Eredivisie, Primeira Liga.'}
+
+    all_matches = matches_raw.get('matches', [])
+
+    # Filter to selected competition first
+    comp_matches = [m for m in all_matches
+                    if str(m.get('competition', {}).get('id', '')) == str(comp_id)
+                    and m.get('score', {}).get('fullTime', {}).get('home') is not None]
+
+    # Use competition matches if enough, otherwise use all finished
+    if len(comp_matches) >= 3:
+        matches = comp_matches[-10:]
+    else:
+        matches = [m for m in all_matches
+                   if m.get('score', {}).get('fullTime', {}).get('home') is not None][-10:]
 
     if len(matches) < 3:
-        return {'error': f'Not enough finished matches found (need ≥3, got {len(matches)})'}
+        comp_name = all_matches[0].get('competition', {}).get('name', 'unknown') if all_matches else 'unknown'
+        return {'error': f'Not enough finished matches for team {team_id} (found {len(matches)}). Your API tier may not support this competition. Try: Premier League, Bundesliga, La Liga, Serie A, Ligue 1, or Champions League.'}
 
-    # Enrich each match with detailed data (lineup + stats)
+    # Enrich with detailed match data (lineup + stats per match)
     enriched = []
     for m in matches:
         detail = fd(f'matches/{m["id"]}', key)
         enriched.append(detail if detail else m)
+        time.sleep(0.1)  # avoid rate limiting
 
-    # Team name from first match
-    team_name = ''
-    short_name = ''
-    for m in enriched:
-        ht = m.get('homeTeam', {})
-        at = m.get('awayTeam', {})
-        if ht.get('id') == team_id:
-            team_name = ht.get('name', '')
-            short_name = ht.get('shortName', team_name)
-            break
-        elif at.get('id') == team_id:
-            team_name = at.get('name', '')
-            short_name = at.get('shortName', team_name)
-            break
-
-    stats = parse_team_stats(team_id, enriched, team_name, short_name)
-    return stats
 
 def parse_team_stats(team_id, matches, team_name, short_name):
     """Extract comprehensive stats from enriched match list."""
