@@ -92,6 +92,9 @@ def save_key():
     save_api_key(key)
     return jsonify({'success': True})
 
+# Competitions available on the free tier
+FREE_TIER_CODES = {'PL', 'BL1', 'PD', 'SA', 'FL1', 'CL', 'DED', 'PPL', 'ELC', 'BSA', 'WC', 'EC'}
+
 @app.route('/api/competitions')
 def get_competitions():
     key = get_api_key()
@@ -102,7 +105,8 @@ def get_competitions():
         return jsonify({'error': 'Failed to reach football-data.org — check your API key is valid'}), 500
     out = [
         {'id': c['id'], 'name': c['name'], 'code': c.get('code',''), 'area': c.get('area', {}).get('name','')}
-        for c in data.get('competitions', []) if c.get('type') == 'LEAGUE'
+        for c in data.get('competitions', [])
+        if c.get('code') in FREE_TIER_CODES
     ]
     return jsonify(sorted(out, key=lambda x: x['name']))
 
