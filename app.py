@@ -108,22 +108,10 @@ def fd(endpoint, api_key, params=None, use_cache=True):
             return data
         elif r.status_code == 429:
             parse_rate_headers(r)
-            reset = int(r.headers.get('X-RequestCounter-Reset', 61))
-            app.logger.warning(f'Rate limited on {endpoint}, waiting {min(reset,65)}s')
-            time.sleep(min(reset, 65))
-            r2 = requests.get(
-                f'https://api.football-data.org/v4/{endpoint}',
-                headers={'X-Auth-Token': api_key},
-                params=params or {},
-                timeout=15
-            )
-            if r2.status_code == 200:
-                parse_rate_headers(r2)
-                data = r2.json()
-                if use_cache:
-                    cache_set(cache_key, data)
-                return data
-            return None
+            reset = int(r.headers.get('X-RequestCounter-Reset', 60))
+            _rate['reset_in_secs'] = reset
+            app.logger.warning(f'Rate limited on {endpoint}, reset in {reset}s — returning None immediately')
+            return None  # Never sleep — let the frontend handle retry
         elif r.status_code == 403:
             app.logger.error(f'403 on {endpoint}: access denied')
             return None
@@ -187,13 +175,15 @@ def save_key():
 @app.route('/api/rate-status')
 def rate_status():
     now = time.time()
-    reset_in = max(0, round(_rate['reset_at'] - now)) if _rate['reset_at'] else 60
+    reset_in = max(0, round(_rate['reset_at'] - now)) if _rate.get('reset_at') else 60
+    limited = _rate.get('remaining', 10) <= 0
     return jsonify({
-        'limit': _rate['limit'],
-        'remaining': _rate['remaining'],
-        'used': _rate['used_this_window'],
+        'limit': _rate.get('limit', 10),
+        'remaining': _rate.get('remaining', 10),
+        'used': _rate.get('used_this_window', 0),
         'reset_in': reset_in,
-        'pct_used': round((_rate['limit'] - _rate['remaining']) / max(_rate['limit'], 1) * 100),
+        'limited': limited,
+        'pct_used': round((_rate.get('limit',10) - _rate.get('remaining',10)) / max(_rate.get('limit',10), 1) * 100),
     })
 
 @app.route('/api/competitions')
@@ -323,7 +313,7 @@ def collect_team_data(team_id, comp_id, key):
         else:
             app.logger.warning(f'Using basic data for match {m["id"]}')
             enriched.append(m)
-        time.sleep(0.3)  # small polite delay between calls
+        # No sleep — cache prevents redundant calls, rate limit handled by fd()
 
     # Get team name from matches
     team_name = ''
