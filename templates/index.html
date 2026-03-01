@@ -642,11 +642,18 @@ async function doSaveKey() {
 async function loadCompetitions() {
   const sel = document.getElementById('compSel');
   sel.innerHTML = '<option>Loading…</option>';
-  const res = await fetch('/api/competitions');
-  if (!res.ok) { sel.innerHTML = '<option value="">Set API key first</option>'; return; }
-  const data = await res.json();
-  sel.innerHTML = '<option value="">Select competition…</option>' +
-    data.map(c => `<option value="${c.id}">${c.name} (${c.area})</option>`).join('');
+  try {
+    const res = await fetch('/api/competitions');
+    const data = await res.json();
+    if (data.error) {
+      sel.innerHTML = '<option value="">⚠ ' + data.error + '</option>';
+      return;
+    }
+    sel.innerHTML = '<option value="">Select competition…</option>' +
+      data.map(c => `<option value="${c.id}">${c.name} (${c.area})</option>`).join('');
+  } catch(e) {
+    sel.innerHTML = '<option value="">Failed to load — check API key</option>';
+  }
 }
 
 async function loadTeams() {
@@ -965,8 +972,20 @@ function renderHistory(id, matches) {
 }
 
 // Init
-window.onload = () => {
-  {% if has_api_key %}loadCompetitions();{% else %}openModal();{% endif %}
+window.onload = async () => {
+  try {
+    const res = await fetch('/api/check-key');
+    const d = await res.json();
+    if (d.has_key) {
+      document.getElementById('apiBtn').classList.add('ok');
+      document.getElementById('apiLabel').textContent = 'API Connected';
+      loadCompetitions();
+    } else {
+      openModal();
+    }
+  } catch(e) {
+    openModal();
+  }
 };
 </script>
 </body>
