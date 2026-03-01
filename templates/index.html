@@ -1035,43 +1035,41 @@ function render(d) {
   renderXI('hXI', hs.likely_xi || []);
   renderXI('aXI', as_.likely_xi || []);
 
-  // Model table
+  // Model table — all 8 models
+  const modelOrder = ['dixon_coles','venue_split','elo','momentum','goal_expectation','defensive','pressure'];
+  const modelRows = modelOrder.map(k => {
+    const mod = m[k]; if (!mod) return '';
+    const note = mod.note ? `<div style="font-size:10px;color:var(--muted);margin-top:2px">${mod.note}</div>` : '';
+    const wt = mod.weight ? `<span style="font-size:10px;color:var(--muted2);margin-left:5px">${mod.weight}%</span>` : '';
+    return `
+      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;font-weight:600">${mod.label||k}${wt}${note}</div>
+      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;color:var(--cyan)">${mod.home_win??'–'}%</div>
+      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;color:var(--amber)">${mod.draw??'–'}%</div>
+      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;color:var(--purple)">${mod.away_win??'–'}%</div>`;
+  }).join('');
+
   document.getElementById('modelTable').innerHTML = `
     <div style="display:grid;grid-template-columns:1fr auto auto auto;gap:0;border:1px solid var(--border);border-radius:8px;overflow:hidden">
       <div style="padding:10px 14px;background:var(--s2);font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Model</div>
       <div style="padding:10px 14px;background:var(--s2);font-size:11px;font-weight:700;color:var(--cyan);text-transform:uppercase;letter-spacing:1px">Home%</div>
       <div style="padding:10px 14px;background:var(--s2);font-size:11px;font-weight:700;color:var(--amber);text-transform:uppercase;letter-spacing:1px">Draw%</div>
       <div style="padding:10px 14px;background:var(--s2);font-size:11px;font-weight:700;color:var(--purple);text-transform:uppercase;letter-spacing:1px">Away%</div>
-
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;font-weight:600">Dixon-Coles Poisson</div>
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;color:var(--cyan)">${m.dixon_coles?.home_win}%</div>
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;color:var(--amber)">${m.dixon_coles?.draw}%</div>
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;color:var(--purple)">${m.dixon_coles?.away_win}%</div>
-
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;font-weight:600">Elo Rating</div>
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;color:var(--cyan)">${m.elo?.home_win}%</div>
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;color:var(--amber)">${m.elo?.draw}%</div>
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;color:var(--purple)">${m.elo?.away_win}%</div>
-
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;font-weight:600;background:rgba(0,212,255,.04)">🏆 Ensemble Final</div>
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;font-weight:800;color:var(--cyan);background:rgba(0,212,255,.04)">${p.home_win}%</div>
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;font-weight:800;color:var(--amber);background:rgba(0,212,255,.04)">${p.draw}%</div>
-      <div style="padding:10px 14px;border-top:1px solid var(--border);font-size:13px;font-weight:800;color:var(--purple);background:rgba(0,212,255,.04)">${p.away_win}%</div>
+      ${modelRows}
+      <div style="padding:10px 14px;border-top:2px solid var(--cyan);font-size:13px;font-weight:700;background:rgba(0,212,255,.06)">🏆 Ensemble Final</div>
+      <div style="padding:10px 14px;border-top:2px solid var(--cyan);font-size:14px;font-weight:800;color:var(--cyan);background:rgba(0,212,255,.06)">${p.home_win}%</div>
+      <div style="padding:10px 14px;border-top:2px solid var(--cyan);font-size:14px;font-weight:800;color:var(--amber);background:rgba(0,212,255,.06)">${p.draw}%</div>
+      <div style="padding:10px 14px;border-top:2px solid var(--cyan);font-size:14px;font-weight:800;color:var(--purple);background:rgba(0,212,255,.06)">${p.away_win}%</div>
     </div>
     <div style="margin-top:16px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
       ${[
-        ['DC Home xG', m.dixon_coles?.home_xg],
-        ['DC Away xG', m.dixon_coles?.away_xg],
-        ['Recency-Wtd Home xG', m.weighted_recency?.home_xg],
-        ['Recency-Wtd Away xG', m.weighted_recency?.away_xg],
-        ['Shot-Quality Home xG', m.shot_quality?.home_xg],
-        ['Shot-Quality Away xG', m.shot_quality?.away_xg],
-        ['Home Elo', m.elo?.home_elo],
-        ['Away Elo', m.elo?.away_elo],
-        ['Home Attack Str', m.strengths?.home_attack],
-        ['Home Defense Str', m.strengths?.home_defense],
-        ['Away Attack Str', m.strengths?.away_attack],
-        ['Away Defense Str', m.strengths?.away_defense],
+        ['Home xG (ensemble)', p.home_xg],
+        ['Away xG (ensemble)', p.away_xg],
+        ['Home Elo', m.elo?.home_elo ?? '–'],
+        ['Away Elo', m.elo?.away_elo ?? '–'],
+        ['Home Momentum', m.momentum?.note?.split(':')[1]?.split('vs')[0]?.trim() ?? '–'],
+        ['Away Momentum', m.momentum?.note?.split('vs')[1]?.trim() ?? '–'],
+        ['Home Def Strength', m.defensive?.note?.split(':')[1]?.split('vs')[0]?.trim() ?? '–'],
+        ['Away Def Strength', m.defensive?.note?.split('vs')[1]?.trim() ?? '–'],
       ].map(([l,v]) => `<div class="sr"><span class="sr-name">${l}</span><span class="sr-val">${v ?? '–'}</span></div>`).join('')}
     </div>`;
 
