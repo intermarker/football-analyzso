@@ -35,6 +35,43 @@ body {
     radial-gradient(ellipse 60% 30% at 90% 110%, rgba(180,122,255,0.04) 0%, transparent 60%);
 }
 
+/* ── Rate Limit Widget ── */
+.rl-widget {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 14px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--s1);
+  font-size: 12px; font-family: 'DM Sans', sans-serif;
+}
+.rl-label { color: var(--muted); white-space: nowrap; }
+.rl-bar-wrap {
+  width: 80px; height: 6px; background: var(--border);
+  border-radius: 3px; overflow: hidden; flex-shrink: 0;
+}
+.rl-bar {
+  height: 100%; border-radius: 3px;
+  transition: width 0.4s ease, background 0.4s ease;
+}
+.rl-nums { font-weight: 700; color: var(--text); white-space: nowrap; }
+.rl-reset { color: var(--muted); white-space: nowrap; }
+
+/* ── Last Update Timer ── */
+.update-timer {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 14px; border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--s1);
+  font-size: 12px; color: var(--muted);
+  font-family: 'DM Sans', sans-serif;
+}
+.update-timer .timer-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--muted); flex-shrink: 0;
+}
+.update-timer.fresh .timer-dot { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.update-timer.stale .timer-dot { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+.update-timer.old   .timer-dot { background: var(--red);   box-shadow: 0 0 6px var(--red); }
+.update-timer .timer-val { font-weight: 700; color: var(--text); }
+
 /* ── Header ── */
 .header {
   display: flex; align-items: center; justify-content: space-between;
@@ -414,10 +451,22 @@ select option { background: #0f1724; }
 <!-- Header -->
 <header class="header">
   <div class="logo"><em>Match</em>IQ<sup>PRO</sup></div>
-  <button class="api-btn {% if has_api_key %}ok{% endif %}" id="apiBtn" onclick="openModal()">
-    <div class="dot"></div>
-    <span id="apiLabel">{% if has_api_key %}API Connected{% else %}Set API Key{% endif %}</span>
-  </button>
+  <div style="display:flex;align-items:center;gap:12px">
+    <div class="rl-widget" id="rlWidget" style="display:none">
+      <span class="rl-label">API</span>
+      <div class="rl-bar-wrap"><div class="rl-bar" id="rlBar"></div></div>
+      <span class="rl-nums"><span id="rlRemaining">–</span>/<span id="rlLimit">–</span></span>
+      <span class="rl-reset" id="rlReset"></span>
+    </div>
+    <div class="update-timer" id="updateTimer" style="display:none">
+      <div class="timer-dot"></div>
+      <span>Last update: <span class="timer-val" id="timerVal">–</span></span>
+    </div>
+    <button class="api-btn {% if has_api_key %}ok{% endif %}" id="apiBtn" onclick="openModal()">
+      <div class="dot"></div>
+      <span id="apiLabel">{% if has_api_key %}API Connected{% else %}Set API Key{% endif %}</span>
+    </button>
+  </div>
 </header>
 
 <!-- API Modal -->
@@ -714,6 +763,75 @@ function showErr(msg) {
   b.classList.add('show');
 }
 
+// ── Rate Limit Widget ─────────────────────────────────────────────────────────
+let rlCountdown = null;
+let rlResetIn = 60;
+
+async function fetchRateStatus() {
+  try {
+    const res = await fetch('/api/rate-status');
+    const d = await res.json();
+    const widget = document.getElementById('rlWidget');
+    widget.style.display = 'flex';
+
+    const remaining = d.remaining ?? 10;
+    const limit = d.limit ?? 10;
+    const pct = Math.round((limit - remaining) / Math.max(limit, 1) * 100);
+
+    document.getElementById('rlRemaining').textContent = remaining;
+    document.getElementById('rlLimit').textContent = limit;
+
+    const bar = document.getElementById('rlBar');
+    bar.style.width = pct + '%';
+    if (pct >= 90)      bar.style.background = 'var(--red)';
+    else if (pct >= 60) bar.style.background = 'var(--amber)';
+    else                bar.style.background = 'var(--green)';
+
+    // Start reset countdown
+    rlResetIn = d.reset_in || 60;
+    if (rlCountdown) clearInterval(rlCountdown);
+    rlCountdown = setInterval(() => {
+      rlResetIn = Math.max(0, rlResetIn - 1);
+      document.getElementById('rlReset').textContent = rlResetIn > 0 ? `↺ ${rlResetIn}s` : '↺ now';
+      if (rlResetIn === 0) {
+        clearInterval(rlCountdown);
+        fetchRateStatus(); // refresh after reset
+      }
+    }, 1000);
+  } catch(e) { /* silent fail */ }
+}
+
+// ── Update Timer ──────────────────────────────────────────────────────────────
+let lastUpdateTime = null;
+let timerInterval = null;
+
+function startTimer() {
+  lastUpdateTime = new Date();
+  const timerEl = document.getElementById('updateTimer');
+  timerEl.style.display = 'flex';
+
+  if (timerInterval) clearInterval(timerInterval);
+  timerInterval = setInterval(() => {
+    if (!lastUpdateTime) return;
+    const secs = Math.floor((new Date() - lastUpdateTime) / 1000);
+    const mins = Math.floor(secs / 60);
+    const hrs  = Math.floor(mins / 60);
+
+    let label;
+    if (secs < 60)       label = `${secs}s ago`;
+    else if (mins < 60)  label = `${mins}m ${secs % 60}s ago`;
+    else                 label = `${hrs}h ${mins % 60}m ago`;
+
+    document.getElementById('timerVal').textContent = label;
+
+    // Color coding: green < 5min, amber < 30min, red >= 30min
+    timerEl.className = 'update-timer';
+    if (mins < 5)       timerEl.classList.add('fresh');
+    else if (mins < 30) timerEl.classList.add('stale');
+    else                timerEl.classList.add('old');
+  }, 1000);
+}
+
 // ── Render ─────────────────────────────────────────────────────────────────
 function verdict(p) {
   if (p >= 78) return '✦ Very Likely';
@@ -724,7 +842,15 @@ function verdict(p) {
 }
 
 function render(d) {
+  // Guard: if key objects are missing, show a clear error
+  if (!d || !d.home_stats || !d.away_stats || !d.predictions) {
+    showErr('Incomplete data returned from server. Check Railway logs for details. Raw: ' + JSON.stringify(d).slice(0,200));
+    return;
+  }
   const p = d.predictions, hs = d.home_stats, as_ = d.away_stats;
+  // Ensure short_name always exists
+  hs.short_name = hs.short_name || hs.team_name || 'Home';
+  as_.short_name = as_.short_name || as_.team_name || 'Away';
   const hr = d.home_rank || {}, ar = d.away_rank || {};
   const h2h = d.h2h || {};
   const m = d.models || {};
@@ -910,6 +1036,8 @@ function render(d) {
   renderHistory('hmList', hs.match_results||[]);
   renderHistory('amList', as_.match_results||[]);
 
+  startTimer();
+  fetchRateStatus();
   document.getElementById('results').classList.add('show');
   document.getElementById('results').scrollIntoView({behavior:'smooth', block:'start'});
 }
@@ -943,14 +1071,18 @@ function renderTeamStats(id, s, isHome) {
 function renderXI(id, xi) {
   const el = document.getElementById(id);
   if (!xi.length) { el.innerHTML = '<p style="color:var(--muted);font-size:13px">No lineup data available from these matches.</p>'; return; }
-  el.innerHTML = xi.map((p, i) =>
-    `<div class="xi-row">
+  el.innerHTML = xi.map((p, i) => {
+    const pos = (p.position||'').replace('Centre-','C-').replace('Defensive ','Def. ').replace('Attacking ','Att. ').replace('Central ','CM ').replace('-Back','B').replace('Winger','Wing');
+    const goals = p.goals || 0;
+    const assists = p.assists || 0;
+    const ga = (goals || assists) ? `<span style="font-size:11px;color:var(--green);margin-left:4px">${goals ? goals+'⚽' : ''}${assists ? ' '+assists+'🅰' : ''}</span>` : '';
+    return `<div class="xi-row">
       <div class="xi-num">${i+1}</div>
-      <div class="xi-name">${p.name}</div>
-      <div class="xi-pos">${p.position.replace('Centre-','C-').replace('Defensive ','Def. ').replace('Attacking ','Att. ').replace('Central ','CM ').replace('-Back','B').replace('Winger','Wing')}</div>
-      <div class="xi-apps" title="${p.appearances} of last ${xi.length} games">${p.appearances}/${xi.length >= 11 ? 10 : xi.length}</div>
-    </div>`
-  ).join('');
+      <div class="xi-name">${p.name}${ga}</div>
+      <div class="xi-pos">${pos}</div>
+      <div class="xi-apps" title="${p.appearances} appearances">${p.appearances}/10</div>
+    </div>`;
+  }).join('');
 }
 
 function renderHistory(id, matches) {
@@ -980,6 +1112,7 @@ window.onload = async () => {
       document.getElementById('apiBtn').classList.add('ok');
       document.getElementById('apiLabel').textContent = 'API Connected';
       loadCompetitions();
+    fetchRateStatus();
     } else {
       openModal();
     }
