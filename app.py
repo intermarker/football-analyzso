@@ -64,6 +64,22 @@ def fd(endpoint, api_key, params=None):
         app.logger.error(f'Exception on {endpoint}: {e}')
         return None
 
+# ─── Global error handlers ───────────────────────────────────────────────────
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    app.logger.error(f'Unhandled exception: {traceback.format_exc()}')
+    return jsonify({'error': str(e)}), 500
+
+@app.errorhandler(404)
+def handle_404(e):
+    return jsonify({'error': 'Not found'}), 404
+
+@app.errorhandler(500)
+def handle_500(e):
+    return jsonify({'error': str(e)}), 500
+
 # ─── Routes ─────────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -122,33 +138,38 @@ def get_teams(comp_id):
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
-    key = get_api_key()
-    if not key:
-        return jsonify({'error': 'No API key'}), 401
-    d = request.json or {}
-    home_id = d.get('home_team_id')
-    away_id = d.get('away_team_id')
-    comp_id = d.get('competition_id')
-    if not all([home_id, away_id, comp_id]):
-        return jsonify({'error': 'Missing parameters'}), 400
+    import traceback
+    try:
+        key = get_api_key()
+        if not key:
+            return jsonify({'error': 'No API key'}), 401
+        d = request.json or {}
+        home_id = d.get('home_team_id')
+        away_id = d.get('away_team_id')
+        comp_id = d.get('competition_id')
+        if not all([home_id, away_id, comp_id]):
+            return jsonify({'error': 'Missing parameters'}), 400
 
-    # Gather all data in parallel (sequential due to API rate limits)
-    home_data = collect_team_data(home_id, comp_id, key)
-    if 'error' in home_data:
-        return jsonify(home_data), 500
-    away_data = collect_team_data(away_id, comp_id, key)
-    if 'error' in away_data:
-        return jsonify(away_data), 500
+        app.logger.info(f'Analyzing: home={home_id} away={away_id} comp={comp_id}')
 
-    # Head-to-head
-    h2h = get_head_to_head(home_id, away_id, key)
+        home_data = collect_team_data(home_id, comp_id, key)
+        if 'error' in home_data:
+            return jsonify(home_data), 500
+        away_data = collect_team_data(away_id, comp_id, key)
+        if 'error' in away_data:
+            return jsonify(away_data), 500
 
-    # League standings for rank context
-    standings = get_standings(comp_id, key)
+        h2h = get_head_to_head(home_id, away_id, key)
+        standings = get_standings(comp_id, key)
 
-    # Build full analysis
-    result = build_analysis(home_data, away_data, h2h, standings)
-    return jsonify(result)
+        # Build full analysis
+        result = build_analysis(home_data, away_data, h2h, standings)
+        return jsonify(result)
+
+    except Exception as e:
+        import traceback
+        app.logger.error(f'Analysis error: {traceback.format_exc()}')
+        return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
 
 # ─── Data Collection ─────────────────────────────────────────────────────────
 
