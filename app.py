@@ -41,28 +41,52 @@ def save_api_key(key):
     with open(API_KEY_FILE, 'w') as f:
         f.write(key.strip())
 
-def fd(endpoint, api_key, params=None):
-    """Fetch from football-data.org. Returns dict on success, None on failure."""
-    try:
-        r = requests.get(
-            f'https://api.football-data.org/v4/{endpoint}',
-            headers={'X-Auth-Token': api_key},
-            params=params or {},
-            timeout=15
-        )
-        app.logger.info(f'GET {endpoint} -> {r.status_code}')
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code == 403:
-            app.logger.error(f'403 on {endpoint}: tier restriction')
-        elif r.status_code == 429:
-            app.logger.error(f'429 on {endpoint}: rate limit')
-        else:
-            app.logger.error(f'{r.status_code} on {endpoint}: {r.text[:200]}')
-        return None
-    except Exception as e:
-        app.logger.error(f'Exception on {endpoint}: {e}')
-        return None
+def fd(endpoint, api_key, params=None, retries=2):
+    """Fetch from football-data.org with retry on rate limit."""
+    import time
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(
+                f'https://api.football-data.org/v4/{endpoint}',
+                headers={'X-Auth-Token': api_key},
+                params=params or {},
+                timeout=15
+            )
+            app.logger.info(f'GET {endpoint} -> {r.status_code}')
+            if r.status_code == 200:
+                return r.json()
+            elif r.status_code == 429:
+                wait = int(r.headers.get('X-RequestCounter-Reset', 60))
+                app.logger.warning(f'Rate limited on {endpoint}, waiting {wait}s (attempt {attempt+1})')
+                if attempt < retries:
+                    time.sleep(min(wait, 65))
+                    continue
+                return None
+            elif r.status_code == 403:
+                app.logger.error(f'403 on {endpoint}: not available on your API tier')
+                return None
+            elif r.status_code == 400:
+                app.logger.error(f'400 on {endpoint}: bad request — {r.text[:200]}')
+                return None
+            elif r.status_code == 404:
+                app.logger.error(f'404 on {endpoint}: not found')
+                return None
+            else:
+                app.logger.error(f'{r.status_code} on {endpoint}: {r.text[:200]}')
+                if attempt < retries:
+                    time.sleep(5)
+                    continue
+                return None
+        except requests.exceptions.Timeout:
+            app.logger.error(f'Timeout on {endpoint} (attempt {attempt+1})')
+            if attempt < retries:
+                time.sleep(3)
+                continue
+            return None
+        except Exception as e:
+            app.logger.error(f'Exception on {endpoint}: {e}')
+            return None
+    return None
 
 # ─── Global error handlers ───────────────────────────────────────────────────
 
@@ -118,7 +142,7 @@ def get_competitions():
         return jsonify({'error': 'No API key set. Click the API button top-right to add your key.'}), 401
     data = fd('competitions', key)
     if not data:
-        return jsonify({'error': 'Failed to reach football-data.org — check your API key is valid'}), 500
+        return jsonify({'error': 'API rate limit hit or key invalid. Wait 60 seconds then refresh the page. Free tier allows 10 requests/minute.'}), 500
     out = [
         {'id': c['id'], 'name': c['name'], 'code': c.get('code',''), 'area': c.get('area', {}).get('name','')}
         for c in data.get('competitions', [])
