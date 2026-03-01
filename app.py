@@ -153,11 +153,11 @@ def analyze():
         app.logger.info(f'Analyzing: home={home_id} away={away_id} comp={comp_id}')
 
         home_data = collect_team_data(home_id, comp_id, key)
-        if 'error' in home_data:
-            return jsonify(home_data), 500
+        if not home_data or 'error' in home_data:
+            return jsonify(home_data or {'error': 'Failed to fetch home team data'}), 500
         away_data = collect_team_data(away_id, comp_id, key)
-        if 'error' in away_data:
-            return jsonify(away_data), 500
+        if not away_data or 'error' in away_data:
+            return jsonify(away_data or {'error': 'Failed to fetch away team data'}), 500
 
         h2h = get_head_to_head(home_id, away_id, key)
         standings = get_standings(comp_id, key)
@@ -241,9 +241,11 @@ def parse_team_stats(team_id, matches, team_name, short_name):
 
     for i, m in enumerate(matches):
         w = decay_weights[i]
-        is_home = m.get('homeTeam', {}).get('id') == team_id
-        my_team = m['homeTeam'] if is_home else m['awayTeam']
-        opp_team = m['awayTeam'] if is_home else m['homeTeam']
+        home_team_obj = m.get('homeTeam') or {}
+        away_team_obj = m.get('awayTeam') or {}
+        is_home = home_team_obj.get('id') == team_id
+        my_team = home_team_obj if is_home else away_team_obj
+        opp_team = away_team_obj if is_home else home_team_obj
         ft = m.get('score', {}).get('fullTime', {})
         scored = (ft.get('home') if is_home else ft.get('away')) or 0
         conceded = (ft.get('away') if is_home else ft.get('home')) or 0
@@ -412,10 +414,10 @@ def get_head_to_head(team_a, team_b, key):
         'limit': 30, 'status': 'FINISHED'
     })
     if not data:
-        return {'matches': [], 'home_wins': 0, 'draws': 0, 'away_wins': 0}
+        return {'matches': [], 'total': 0, 'home_wins': 0, 'draws': 0, 'away_wins': 0}
 
     h2h_matches = []
-    for m in data.get('matches', []):
+    for m in (data.get('matches') or []):
         ht_id = m.get('homeTeam', {}).get('id')
         at_id = m.get('awayTeam', {}).get('id')
         if {ht_id, at_id} == {team_a, team_b}:
@@ -440,24 +442,31 @@ def get_head_to_head(team_a, team_b, key):
     }
 
 def get_standings(comp_id, key):
-    data = fd(f'competitions/{comp_id}/standings', key)
-    if not data:
+    try:
+        data = fd(f'competitions/{comp_id}/standings', key)
+        if not data:
+            return {}
+        rank_map = {}
+        for table in (data.get('standings') or []):
+            if table.get('type') == 'TOTAL':
+                for row in (table.get('table') or []):
+                    tid = (row.get('team') or {}).get('id')
+                    if tid:
+                        rank_map[int(tid)] = {
+                            'position': row.get('position') or 0,
+                            'points': row.get('points') or 0,
+                            'gd': row.get('goalDifference') or 0,
+                            'played': row.get('playedGames') or 0,
+                            'won': row.get('won') or 0,
+                            'draw': row.get('draw') or 0,
+                            'lost': row.get('lost') or 0,
+                            'goals_for': row.get('goalsFor') or 0,
+                            'goals_against': row.get('goalsAgainst') or 0,
+                        }
+        return rank_map
+    except Exception as e:
+        app.logger.error(f'get_standings error: {e}')
         return {}
-    rank_map = {}
-    for table in data.get('standings', []):
-        if table.get('type') == 'TOTAL':
-            for row in table.get('table', []):
-                tid = row.get('team', {}).get('id')
-                if tid:
-                    rank_map[tid] = {
-                        'position': row.get('position'),
-                        'points': row.get('points'),
-                        'gd': row.get('goalDifference'),
-                        'played': row.get('playedGames'),
-                        'won': row.get('won'), 'draw': row.get('draw'), 'lost': row.get('lost'),
-                        'goals_for': row.get('goalsFor'), 'goals_against': row.get('goalsAgainst'),
-                    }
-    return rank_map
 
 # ─── Statistical Models ───────────────────────────────────────────────────────
 
@@ -502,8 +511,9 @@ def build_analysis(home_data, away_data, h2h, standings):
     away_id = as_['team_id']
 
     # ── League context ────
-    home_rank = standings.get(home_id, {})
-    away_rank = standings.get(away_id, {})
+    standings = standings or {}
+    home_rank = standings.get(int(home_id), {}) or {}
+    away_rank = standings.get(int(away_id), {}) or {}
 
     # ── Compute xG proxies ────────────────────────────────────────────────────
     # League average baselines
