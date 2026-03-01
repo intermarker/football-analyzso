@@ -182,17 +182,43 @@ select option { background: #0f1724; }
 .run-btn:disabled { opacity: .35; cursor: not-allowed; transform: none; }
 
 /* ── Loading ── */
-.loading { display: none; text-align: center; padding: 70px 0; }
+.loading { display: none; padding: 40px 0; }
 .loading.show { display: block; }
-.spinner {
-  width: 52px; height: 52px; margin: 0 auto 18px;
-  border: 3px solid var(--border); border-top-color: var(--cyan);
-  border-radius: 50%; animation: spin .7s linear infinite;
+.progress-box {
+  background: var(--s1); border: 1px solid var(--border);
+  border-radius: 12px; padding: 28px 32px; max-width: 560px; margin: 0 auto;
 }
-@keyframes spin { to { transform: rotate(360deg); } }
-.loading-steps { display: flex; flex-direction: column; gap: 6px; align-items: center; margin-top: 14px; }
-.loading-step { font-size: 13px; color: var(--muted); }
-.loading-step.active { color: var(--cyan); }
+.progress-title {
+  font-family: 'Syne', sans-serif; font-size: 15px; font-weight: 700;
+  color: var(--text); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 20px;
+  display: flex; align-items: center; gap: 10px;
+}
+.progress-title .pulse {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--cyan);
+  animation: pulse-anim 1s ease-in-out infinite;
+}
+@keyframes pulse-anim { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:0.4; transform:scale(0.7); } }
+.progress-bar-wrap {
+  height: 6px; background: var(--border); border-radius: 3px; margin-bottom: 20px; overflow: hidden;
+}
+.progress-bar-fill {
+  height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--cyan), var(--purple));
+  transition: width 0.4s ease; width: 0%;
+}
+.progress-steps { display: flex; flex-direction: column; gap: 0; }
+.pstep {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 13px;
+  color: var(--muted); transition: color 0.2s;
+}
+.pstep:last-child { border-bottom: none; }
+.pstep.done { color: var(--text); }
+.pstep.active { color: var(--cyan); }
+.pstep.error { color: var(--red); }
+.pstep-icon { width: 18px; text-align: center; flex-shrink: 0; margin-top: 1px; font-size: 13px; }
+.pstep-text { flex: 1; }
+.pstep-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.pstep-time { font-size: 11px; color: var(--muted2); flex-shrink: 0; }
 
 /* ── Error ── */
 .err-box {
@@ -520,13 +546,15 @@ select option { background: #0f1724; }
 
   <!-- Loading -->
   <div class="loading" id="loading">
-    <div class="spinner"></div>
-    <p style="color:var(--muted);font-size:14px">Building advanced statistical model…</p>
-    <div class="loading-steps">
-      <div class="loading-step" id="ls1">▸ Fetching last 10 league matches + full stats</div>
-      <div class="loading-step" id="ls2">▸ Loading match lineups & player data</div>
-      <div class="loading-step" id="ls3">▸ Retrieving head-to-head history</div>
-      <div class="loading-step" id="ls4">▸ Running Dixon-Coles + Elo ensemble</div>
+    <div class="progress-box">
+      <div class="progress-title">
+        <div class="pulse"></div>
+        <span id="progressTitle">Preparing Analysis…</span>
+      </div>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar-fill" id="progressBar"></div>
+      </div>
+      <div class="progress-steps" id="progressSteps"></div>
     </div>
   </div>
 
@@ -737,41 +765,106 @@ async function runAnalysis() {
   await doAnalysis(hid, aid, cid);
 }
 
-async function doAnalysis(hid, aid, cid) {
-  // Check rate limit first
-  const rlRes = await fetch('/api/rate-status').catch(() => null);
-  if (rlRes) {
-    const rl = await rlRes.json();
-    if (rl.limited || rl.remaining <= 1) {
-      showRateLimitWait(rl.reset_in);
-      return;
-    }
-  }
+// Progress steps definition
+const STEPS = [
+  { id: 'comp',      icon: '🏆', label: 'Competition' },
+  { id: 'home',      icon: '🏠', label: 'Home Team Matches' },
+  { id: 'away',      icon: '✈️',  label: 'Away Team Matches' },
+  { id: 'h2h',       icon: '⚔️',  label: 'Head-to-Head History' },
+  { id: 'standings', icon: '📊', label: 'League Standings' },
+  { id: 'models',    icon: '🧠', label: 'Statistical Models' },
+];
 
+function initProgress() {
+  document.getElementById('progressBar').style.width = '0%';
+  document.getElementById('progressTitle').textContent = 'Preparing Analysis…';
+  const container = document.getElementById('progressSteps');
+  container.innerHTML = STEPS.map(s =>
+    `<div class="pstep" id="ps_${s.id}">
+      <div class="pstep-icon">⏳</div>
+      <div class="pstep-text">
+        <div>${s.icon} ${s.label}</div>
+        <div class="pstep-sub" id="ps_sub_${s.id}"></div>
+      </div>
+      <div class="pstep-time" id="ps_time_${s.id}"></div>
+    </div>`
+  ).join('');
+}
+
+function updateStep(step, status, msg, sub, pct) {
+  const el = document.getElementById(`ps_${step}`);
+  if (!el) return;
+  const iconEl = el.querySelector('.pstep-icon');
+  const subEl = document.getElementById(`ps_sub_${step}`);
+
+  el.className = 'pstep ' + status;
+  iconEl.textContent = status === 'done' ? '✅' : status === 'error' ? '❌' : status === 'active' ? '⏳' : '⏳';
+
+  if (sub) subEl.textContent = sub;
+  if (status === 'done' || status === 'error') {
+    const timeEl = document.getElementById(`ps_time_${step}`);
+    if (timeEl) timeEl.textContent = msg;
+  }
+  if (pct > 0) {
+    document.getElementById('progressBar').style.width = pct + '%';
+  }
+}
+
+async function doAnalysis(hid, aid, cid) {
   document.getElementById('loading').classList.add('show');
   document.getElementById('results').classList.remove('show');
   document.getElementById('errBox').classList.remove('show');
-
-  const steps = ['ls1','ls2','ls3','ls4'];
-  steps.forEach((s,i) => setTimeout(() => document.getElementById(s).classList.add('active'), i*600));
+  initProgress();
 
   try {
-    const res = await fetch('/api/analyze', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({home_team_id:hid, away_team_id:aid, competition_id:cid})
+    const res = await fetch('/api/analyze/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ home_team_id: hid, away_team_id: aid, competition_id: cid })
     });
-    const data = await res.json();
-    document.getElementById('loading').classList.remove('show');
-    steps.forEach(s => document.getElementById(s).classList.remove('active'));
 
-    if (data.error && data.error.toLowerCase().includes('rate')) {
-      // Rate limited mid-request — auto retry after cooldown
-      showRateLimitWait(62);
-      return;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+
+          if (data.step) {
+            // Progress update
+            updateStep(data.step, data.status, data.msg, data.sub, data.pct);
+            if (data.pct >= 5) {
+              document.getElementById('progressTitle').textContent = data.msg;
+            }
+          } else if (data.result) {
+            // Final result
+            document.getElementById('progressBar').style.width = '100%';
+            document.getElementById('progressTitle').textContent = '✅ Analysis Complete';
+            await new Promise(r => setTimeout(r, 500));
+            document.getElementById('loading').classList.remove('show');
+            render(data.result);
+            fetchRateStatus();
+          } else if (data.error) {
+            document.getElementById('loading').classList.remove('show');
+            if (data.error.toLowerCase().includes('rate')) {
+              showRateLimitWait(62);
+            } else {
+              showErr(data.error);
+            }
+          }
+        } catch(e) { /* skip malformed lines */ }
+      }
     }
-    if (data.error) { showErr(data.error); return; }
-    render(data);
-    fetchRateStatus();
   } catch(e) {
     document.getElementById('loading').classList.remove('show');
     showErr('Request failed: ' + e.message);
@@ -785,7 +878,7 @@ function showRateLimitWait(seconds) {
   const errBox = document.getElementById('errBox');
   
   const update = () => {
-    errBox.innerHTML = `⏳ API rate limit reached — auto-retrying in <strong>${secs}s</strong>. The free tier allows 10 requests/minute.`;
+    errBox.innerHTML = `⏳ API rate limit reached — auto-retrying in <strong>${secs}s</strong>. First analysis uses ~15 API calls; repeat analyses use cache and are instant.`;
     errBox.classList.add('show');
     errBox.style.color = 'var(--amber)';
     errBox.style.borderColor = 'rgba(255,171,0,.3)';
