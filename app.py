@@ -47,27 +47,35 @@ def fd(endpoint, api_key, params=None):
             f'https://api.football-data.org/v4/{endpoint}',
             headers={'X-Auth-Token': api_key},
             params=params or {},
-            timeout=12
+            timeout=15
         )
         if r.status_code == 200:
             return r.json()
+        app.logger.error(f'API {endpoint} returned {r.status_code}: {r.text[:200]}')
         return None
-    except Exception:
+    except Exception as e:
+        app.logger.error(f'API {endpoint} exception: {e}')
         return None
 
 # ─── Routes ─────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
-    return render_template('index.html', has_api_key=bool(get_api_key()))
+    has_key = bool(get_api_key())
+    return render_template('index.html', has_api_key=has_key)
+
+@app.route('/api/check-key')
+def check_key():
+    return jsonify({'has_key': bool(get_api_key())})
 
 @app.route('/api/save-key', methods=['POST'])
 def save_key():
     key = (request.json or {}).get('api_key', '').strip()
     if not key:
         return jsonify({'error': 'No API key provided'}), 400
-    if fd('competitions', key) is None:
-        return jsonify({'error': 'Invalid or unauthorised API key'}), 400
+    result = fd('competitions', key)
+    if result is None:
+        return jsonify({'error': 'Invalid or unauthorised API key — check your token at football-data.org'}), 400
     save_api_key(key)
     return jsonify({'success': True})
 
@@ -75,10 +83,10 @@ def save_key():
 def get_competitions():
     key = get_api_key()
     if not key:
-        return jsonify({'error': 'No API key'}), 401
+        return jsonify({'error': 'No API key set. Click the API button top-right to add your key.'}), 401
     data = fd('competitions', key)
     if not data:
-        return jsonify({'error': 'Failed'}), 500
+        return jsonify({'error': 'Failed to reach football-data.org — check your API key is valid'}), 500
     out = [
         {'id': c['id'], 'name': c['name'], 'code': c.get('code',''), 'area': c.get('area', {}).get('name','')}
         for c in data.get('competitions', []) if c.get('type') == 'LEAGUE'
