@@ -60,7 +60,7 @@ def fd(endpoint, api_key, params=None, retries=2):
                 # Never block the worker waiting for rate limit reset
                 return None
             elif r.status_code == 403:
-                app.logger.error(f'403 on {endpoint}: not available on your API tier')
+                app.logger.error(f'403 on {endpoint}: access denied')
                 return None
             elif r.status_code == 400:
                 app.logger.error(f'400 on {endpoint}: bad request — {r.text[:200]}')
@@ -129,9 +129,6 @@ def save_key():
     save_api_key(key)
     return jsonify({'success': True})
 
-# Competitions available on the free tier
-FREE_TIER_CODES = {'PL', 'BL1', 'PD', 'SA', 'FL1', 'CL', 'DED', 'PPL', 'ELC', 'BSA', 'WC', 'EC'}
-
 @app.route('/api/competitions')
 def get_competitions():
     key = get_api_key()
@@ -139,11 +136,10 @@ def get_competitions():
         return jsonify({'error': 'No API key set. Click the API button top-right to add your key.'}), 401
     data = fd('competitions', key)
     if not data:
-        return jsonify({'error': 'API rate limit hit or key invalid. Wait 60 seconds then refresh the page. Free tier allows 10 requests/minute.'}), 500
+        return jsonify({'error': 'API rate limit hit. Wait 60 seconds then refresh the page.'}), 500
     out = [
         {'id': c['id'], 'name': c['name'], 'code': c.get('code',''), 'area': c.get('area', {}).get('name','')}
         for c in data.get('competitions', [])
-        if c.get('code') in FREE_TIER_CODES
     ]
     return jsonify(sorted(out, key=lambda x: x['name']))
 
@@ -152,7 +148,7 @@ def get_teams(comp_id):
     key = get_api_key()
     data = fd(f'competitions/{comp_id}/teams', key)
     if not data:
-        return jsonify({'error': 'Cannot load teams for this competition. Your API subscription tier may not support it. Please select Premier League, Bundesliga, La Liga, Serie A, Ligue 1, or Champions League.'}), 403
+        return jsonify({'error': 'Cannot load teams for this competition. Try again in 60 seconds (rate limit).'}), 403
     teams = [{'id': t['id'], 'name': t['name'], 'shortName': t.get('shortName', t['name']),
                'crest': t.get('crest','')} for t in data.get('teams', [])]
     return jsonify(sorted(teams, key=lambda x: x['name']))
@@ -229,7 +225,7 @@ def collect_team_data(team_id, comp_id, key):
             app.logger.warning(f'Using cross-competition fallback: {len(all_matches)} matches')
 
     if not all_matches:
-        return {'error': f'Cannot fetch any matches for team {team_id}. The API returned no data. This may be a rate limit — wait 60 seconds and try again.'}
+        return {'error': f'Cannot fetch matches for team {team_id}. API returned no data — wait 60 seconds and try again.'}
 
     # Filter to finished matches with scores
     finished = [m for m in all_matches
@@ -237,7 +233,7 @@ def collect_team_data(team_id, comp_id, key):
     matches = finished[-10:]
 
     if len(matches) < 3:
-        return {'error': f'Only {len(matches)} finished matches found for team {team_id}. Need at least 3 to run analysis.'}
+        return {'error': f'Only {len(matches)} finished matches found for team {team_id}. Need at least 3 to analyse.'}
 
     # Enrich with detailed match data (lineup + stats per match)
     # Use a short delay between calls to avoid hitting the 10 req/min free tier limit
