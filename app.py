@@ -545,6 +545,21 @@ def parse_team_stats(team_id, matches, team_name, short_name):
 
         # Match history
         'match_results': results,
+
+        # Raw arrays for advanced models
+        'gs_list': gs,            # goals scored per match
+        'gc_list': gc,            # goals conceded per match
+        'form_list': form,        # W/D/L list
+        'weights': decay_weights, # exponential recency weights
+
+        # Defensive
+        'avg_saves': avg(saves),
+        'avg_shots_conceded': avg(shots_total),  # proxy for opp pressure
+        'avg_red_cards': avg(red_cards),
+
+        # Pressure
+        'avg_corners': avg(corners),
+        'avg_fouls': avg(fouls),
     }
 
 def get_head_to_head(team_a, team_b, key):
@@ -636,6 +651,68 @@ def get_standings(comp_id, key):
 
 # ─── Statistical Models ───────────────────────────────────────────────────────
 
+def safe_div(a, b, default=0):
+    return a / b if b else default
+
+# Model: Momentum — exponentially weighted W/D/L trend
+# Captures whether a team is on a hot streak or fading
+def momentum_score(form_list, weights):
+    """Returns a score 0-1 where 1 = perfect recent form, 0 = awful."""
+    if not form_list:
+        return 0.5
+    pts = {'W': 1.0, 'D': 0.5, 'L': 0.0}
+    n = min(len(form_list), len(weights))
+    w_sum = sum(weights[:n])
+    score = sum(pts[form_list[i]] * weights[i] for i in range(n)) / max(w_sum, 1)
+    return score  # 0.0 to 1.0
+
+# Model: Home/Away Venue Split
+# Uses venue-specific attack/defense rather than blended averages
+def venue_xg(hs, as_):
+    """xG using home team's home stats vs away team's away stats."""
+    h_scored  = hs.get('avg_home_scored', hs['avg_scored'])
+    h_conceded= hs.get('avg_home_conceded', hs['avg_conceded'])
+    a_scored  = as_.get('avg_away_scored', as_['avg_scored'])
+    a_conceded= as_.get('avg_away_conceded', as_['avg_conceded'])
+
+    # Use geometric mean of attack vs opponent defence
+    home_xg = (h_scored + (1 - safe_div(a_conceded, a_scored + a_conceded, 0.5))) / 2 * 1.15
+    away_xg = (a_scored + (1 - safe_div(h_conceded, h_scored + h_conceded, 0.5))) / 2 * 0.85
+    return max(0.2, home_xg), max(0.1, away_xg)
+
+# Model: Defensive Dominance
+# Clean sheet rate, saves per game, low shots conceded = defensive strength
+def defensive_strength(stats):
+    """0-1 score: how defensively solid is this team?"""
+    cs = stats.get('clean_sheet_pct', 0) / 100         # 0-1
+    saves = min(stats.get('avg_saves', 3) / 6, 1)      # normalised, 6 saves = elite
+    low_concede = max(0, 1 - stats.get('avg_conceded', 1.5) / 3)  # 0 goals = 1, 3+ = 0
+    return (cs * 0.4 + saves * 0.2 + low_concede * 0.4)
+
+# Model: Pressure / Territorial Dominance Index
+# Corners won = territory, fouls committed inversely = fair play / pressing
+def pressure_index(stats):
+    """0-1: how much does this team dominate territory?"""
+    corners = min(stats.get('avg_corners', 4) / 8, 1)    # 8 corners = dominant
+    possession = min(stats.get('avg_possession', 50) / 70, 1)  # 70% poss = dominant
+    shots = min(stats.get('avg_shots_on', 3) / 6, 1)     # 6 SoT = elite
+    return (corners * 0.3 + possession * 0.4 + shots * 0.3)
+
+# Model: Scoreline Tendency (Goal Expectation Spread)
+# Teams that win big have different risk profiles than 1-0 merchants
+def goal_expectation_model(gs_list, gc_list, weights):
+    """Returns weighted avg goals scored & conceded and their variance."""
+    if not gs_list:
+        return 1.2, 1.2, 0.5, 0.5
+    n = min(len(gs_list), len(weights))
+    w_sum = sum(weights[:n])
+    w_gs = sum(gs_list[i] * weights[i] for i in range(n)) / max(w_sum, 1)
+    w_gc = sum(gc_list[i] * weights[i] for i in range(n)) / max(w_sum, 1)
+    # Variance: high variance = unpredictable team
+    gs_var = sum((gs_list[i] - w_gs)**2 * weights[i] for i in range(n)) / max(w_sum, 1)
+    gc_var = sum((gc_list[i] - w_gc)**2 * weights[i] for i in range(n)) / max(w_sum, 1)
+    return w_gs, w_gc, math.sqrt(gs_var), math.sqrt(gc_var)
+
 def poisson_prob(lam, k):
     if lam <= 0: lam = 0.01
     return math.exp(-lam) * (lam ** k) / math.factorial(min(k, 20))
@@ -716,19 +793,47 @@ def build_analysis(home_data, away_data, h2h, standings):
     # ── Elo Ratings ──────────────────────────────────────────────────────────
     # Bootstrap Elo from league position if available, else use form points
     def elo_from_standing(rank_data, form_pts):
-        pos = rank_data.get('position', 10)
-        pts = rank_data.get('points', form_pts * 3)
+        played = max(rank_data.get('played', 10), 1)
+        pts = rank_data.get('points', 0)
         gd = rank_data.get('gd', 0)
-        return 1500 - (pos - 1) * 30 + gd * 2 + pts * 0.5
 
-    home_elo = elo_from_standing(home_rank, hs['form_pts'])
-    away_elo = elo_from_standing(away_rank, as_['form_pts'])
+        # Points per game: average team ~1.35 PPG
+        # Multiplier of 50 means best team (3.0 PPG) = 1500 + 83 = 1583
+        # Worst team (0.5 PPG) = 1500 - 43 = 1457 — tight, realistic spread
+        ppg = pts / played
+        ppg_elo = 1500 + (ppg - 1.35) * 50
+
+        # GD per game — very small signal
+        gdpg = gd / played
+        gd_adj = gdpg * 3
+
+        # Recent form over last 5 games (0-15 pts), tiny nudge
+        form_adj = (form_pts - 7.5) * 1.5
+
+        raw = ppg_elo + gd_adj + form_adj
+        # Clamp: max 150pt spread each side — about 21% win prob swing max
+        return max(1350, min(1650, raw))
+
+    if home_rank:
+        home_elo = elo_from_standing(home_rank, hs['form_pts'])
+    else:
+        home_elo = 1500 + (hs['form_pts'] - 7.5) * 4
+
+    if away_rank:
+        away_elo = elo_from_standing(away_rank, as_['form_pts'])
+    else:
+        away_elo = 1500 + (as_['form_pts'] - 7.5) * 4
+
+    home_elo = max(1350, min(1650, home_elo))
+    away_elo = max(1350, min(1650, away_elo))
 
     elo_home_prob = elo_expected(home_elo, away_elo)
-    elo_draw_zone = 0.22  # typical draw rate in football
-    elo_hw = max(0.1, elo_home_prob - elo_draw_zone / 2)
-    elo_aw = max(0.1, 1 - elo_home_prob - elo_draw_zone / 2)
-    elo_d = max(0.1, 1 - elo_hw - elo_aw)
+    elo_draw_zone = 0.25
+    elo_hw = max(0.05, elo_home_prob - elo_draw_zone / 2)
+    elo_aw = max(0.05, 1 - elo_home_prob - elo_draw_zone / 2)
+    elo_d  = max(0.10, 1 - elo_hw - elo_aw)
+    _s = elo_hw + elo_d + elo_aw
+    elo_hw /= _s; elo_d /= _s; elo_aw /= _s
 
     # ── Dixon-Coles scoreline simulation ─────────────────────────────────────
     score_matrix = simulate_scorelines(home_xg, away_xg)
@@ -747,23 +852,98 @@ def build_analysis(home_data, away_data, h2h, standings):
     emp_o15   = (hs['over_1_5_pct'] + as_['over_1_5_pct']) / 2 / 100
     emp_o25   = (hs['over_2_5_pct'] + as_['over_2_5_pct']) / 2 / 100
 
+    # ── Model 4: Momentum ─────────────────────────────────────────────────────
+    h_momentum = momentum_score(hs.get('form_list', hs['form']), hs.get('weights', [1]*10))
+    a_momentum = momentum_score(as_.get('form_list', as_['form']), as_.get('weights', [1]*10))
+    # Convert momentum diff to 1X2 signal (centred at 0.5 each side)
+    mom_diff = h_momentum - a_momentum  # -1 to +1
+    mom_hw = max(0.1, 0.45 + mom_diff * 0.35)
+    mom_aw = max(0.1, 0.30 - mom_diff * 0.35)
+    mom_d  = max(0.1, 1 - mom_hw - mom_aw)
+    _s = mom_hw + mom_d + mom_aw
+    mom_hw /= _s; mom_d /= _s; mom_aw /= _s
+
+    # ── Model 5: Venue Split xG ───────────────────────────────────────────────
+    venue_h_xg, venue_a_xg = venue_xg(hs, as_)
+    venue_matrix = simulate_scorelines(venue_h_xg, venue_a_xg)
+    venue_hw = sum(p for (h,a), p in venue_matrix.items() if h > a)
+    venue_d  = sum(p for (h,a), p in venue_matrix.items() if h == a)
+    venue_aw = sum(p for (h,a), p in venue_matrix.items() if h < a)
+
+    # ── Model 6: Defensive Dominance ─────────────────────────────────────────
+    h_def = defensive_strength(hs)
+    a_def = defensive_strength(as_)
+    # Defensive edge → suppresses opponent goals → boosts clean sheet / low score
+    def_edge_home = h_def - a_def  # positive = home stronger defensively
+    # Translate to 1X2: strong defence = slightly higher draw/win rate
+    def_hw = max(0.1, 0.45 + def_edge_home * 0.2)
+    def_aw = max(0.1, 0.30 - def_edge_home * 0.2)
+    def_d  = max(0.1, 1 - def_hw - def_aw)
+    _s = def_hw + def_d + def_aw
+    def_hw /= _s; def_d /= _s; def_aw /= _s
+
+    # ── Model 7: Pressure / Territorial Index ────────────────────────────────
+    h_press = pressure_index(hs)
+    a_press = pressure_index(as_)
+    press_diff = h_press - a_press
+    press_hw = max(0.1, 0.45 + press_diff * 0.3)
+    press_aw = max(0.1, 0.30 - press_diff * 0.3)
+    press_d  = max(0.1, 1 - press_hw - press_aw)
+    _s = press_hw + press_d + press_aw
+    press_hw /= _s; press_d /= _s; press_aw /= _s
+
+    # ── Model 8: Goal Expectation Spread (Scoreline Tendency) ─────────────────
+    h_wgs, h_wgc, h_gs_std, _ = goal_expectation_model(
+        hs.get('gs_list',[]), hs.get('gc_list',[]), hs.get('weights',[1]*10))
+    a_wgs, a_wgc, a_gs_std, _ = goal_expectation_model(
+        as_.get('gs_list',[]), as_.get('gc_list',[]), as_.get('weights',[1]*10))
+    ge_matrix = simulate_scorelines(max(0.3, h_wgs), max(0.2, a_wgs))
+    ge_hw = sum(p for (h,a), p in ge_matrix.items() if h > a)
+    ge_d  = sum(p for (h,a), p in ge_matrix.items() if h == a)
+    ge_aw = sum(p for (h,a), p in ge_matrix.items() if h < a)
+
     # ── H2H adjustment ────────────────────────────────────────────────────────
-    h2h_adj = 0
     if h2h['total'] >= 3:
         h2h_hw_rate = h2h['home_wins'] / h2h['total']
         h2h_aw_rate = h2h['away_wins'] / h2h['total']
-        h2h_adj_home = (h2h_hw_rate - 0.45) * 0.1
-        h2h_adj_away = (h2h_aw_rate - 0.30) * 0.1
+        h2h_adj_home = (h2h_hw_rate - 0.45) * 0.08
+        h2h_adj_away = (h2h_aw_rate - 0.30) * 0.08
     else:
         h2h_adj_home = h2h_adj_away = 0
 
     # ── Final Ensemble ────────────────────────────────────────────────────────
-    # 1X2: Poisson 50% + Elo 30% + Empirical 20%
-    final_hw = round((hw_poisson * 0.50 + elo_hw * 0.30 + hs['win_pct'] / 100 * 0.20) + h2h_adj_home, 4)
-    final_aw = round((aw_poisson * 0.50 + elo_aw * 0.30 + as_['win_pct'] / 100 * 0.20) + h2h_adj_away, 4)
-    final_d  = round(max(0.05, 1 - final_hw - final_aw), 4)
+    # Weights chosen so no single model dominates:
+    # Dixon-Coles Poisson:   25% (core statistical model)
+    # Venue Split xG:        15% (home/away specific)
+    # Elo Rating:            15% (season-long strength)
+    # Momentum:              15% (recent trajectory)
+    # Goal Expectation:      10% (scoreline tendency)
+    # Defensive Dominance:   10% (defensive signal)
+    # Pressure Index:        10% (territorial control)
+    W = dict(poisson=0.25, venue=0.15, elo=0.15, momentum=0.15,
+             ge=0.10, defense=0.10, pressure=0.10)
 
-    # Normalize
+    final_hw = round(
+        hw_poisson * W['poisson'] +
+        venue_hw   * W['venue']   +
+        elo_hw     * W['elo']     +
+        mom_hw     * W['momentum']+
+        ge_hw      * W['ge']      +
+        def_hw     * W['defense'] +
+        press_hw   * W['pressure']+
+        h2h_adj_home, 4)
+    final_aw = round(
+        aw_poisson * W['poisson'] +
+        venue_aw   * W['venue']   +
+        elo_aw     * W['elo']     +
+        mom_aw     * W['momentum']+
+        ge_aw      * W['ge']      +
+        def_aw     * W['defense'] +
+        press_aw   * W['pressure']+
+        h2h_adj_away, 4)
+    final_d = round(max(0.05, 1 - final_hw - final_aw), 4)
+
+    # Normalize to sum to 100%
     total_1x2 = final_hw + final_d + final_aw
     final_hw = round(final_hw / total_1x2 * 100, 1)
     final_d  = round(final_d  / total_1x2 * 100, 1)
@@ -773,7 +953,7 @@ def build_analysis(home_data, away_data, h2h, standings):
     btts_final = round((btts_poisson * 0.55 + emp_btts * 0.45) * 100, 1)
     o15_final  = round((o15_poisson  * 0.55 + emp_o15  * 0.45) * 100, 1)
     o25_final  = round((o25_poisson  * 0.55 + emp_o25  * 0.45) * 100, 1)
-    o35_final  = round( o35_poisson * 100, 1)
+    o35_final  = round(o35_poisson * 100, 1)
 
     # Top scorelines
     top_scores = sorted(
@@ -781,36 +961,64 @@ def build_analysis(home_data, away_data, h2h, standings):
         key=lambda x: -x['prob']
     )[:10]
 
-    # Model breakdown for transparency
+    # Model breakdown for transparency — all 8 models
     models = {
         'dixon_coles': {
+            'label': 'Dixon-Coles Poisson',
+            'weight': 25,
             'home_win': round(hw_poisson * 100, 1),
             'draw': round(d_poisson * 100, 1),
             'away_win': round(aw_poisson * 100, 1),
-            'home_xg': round(xg_home_dc, 3),
-            'away_xg': round(xg_away_dc, 3),
+            'note': f'xG: {round(home_xg,2)} vs {round(away_xg,2)}',
+        },
+        'venue_split': {
+            'label': 'Venue Split xG',
+            'weight': 15,
+            'home_win': round(venue_hw * 100, 1),
+            'draw': round(venue_d * 100, 1),
+            'away_win': round(venue_aw * 100, 1),
+            'note': f'Home-specific xG: {round(venue_h_xg,2)} vs {round(venue_a_xg,2)}',
         },
         'elo': {
+            'label': 'Elo Rating',
+            'weight': 15,
             'home_win': round(elo_hw * 100, 1),
             'draw': round(elo_d * 100, 1),
             'away_win': round(elo_aw * 100, 1),
-            'home_elo': round(home_elo, 0),
-            'away_elo': round(away_elo, 0),
+            'note': f'Elo: {round(home_elo)} vs {round(away_elo)}',
         },
-        'weighted_recency': {
-            'home_xg': round(xg_home_wr, 3),
-            'away_xg': round(xg_away_wr, 3),
+        'momentum': {
+            'label': 'Momentum',
+            'weight': 15,
+            'home_win': round(mom_hw * 100, 1),
+            'draw': round(mom_d * 100, 1),
+            'away_win': round(mom_aw * 100, 1),
+            'note': f'Form score: {round(h_momentum,2)} vs {round(a_momentum,2)}',
         },
-        'shot_quality': {
-            'home_xg': round(xg_home_sq, 3),
-            'away_xg': round(xg_away_sq, 3),
+        'goal_expectation': {
+            'label': 'Goal Expectation',
+            'weight': 10,
+            'home_win': round(ge_hw * 100, 1),
+            'draw': round(ge_d * 100, 1),
+            'away_win': round(ge_aw * 100, 1),
+            'note': f'Weighted avg goals: {round(h_wgs,2)} vs {round(a_wgs,2)}',
         },
-        'strengths': {
-            'home_attack': round(home_att, 3),
-            'home_defense': round(home_def, 3),
-            'away_attack': round(away_att, 3),
-            'away_defense': round(away_def, 3),
-        }
+        'defensive': {
+            'label': 'Defensive Dominance',
+            'weight': 10,
+            'home_win': round(def_hw * 100, 1),
+            'draw': round(def_d * 100, 1),
+            'away_win': round(def_aw * 100, 1),
+            'note': f'Def strength: {round(h_def,2)} vs {round(a_def,2)}',
+        },
+        'pressure': {
+            'label': 'Pressure Index',
+            'weight': 10,
+            'home_win': round(press_hw * 100, 1),
+            'draw': round(press_d * 100, 1),
+            'away_win': round(press_aw * 100, 1),
+            'note': f'Press score: {round(h_press,2)} vs {round(a_press,2)}',
+        },
     }
 
     confidence = 'High' if min(hs['matches_analyzed'], as_['matches_analyzed']) >= 8 else \
