@@ -726,20 +726,34 @@ function checkReady() {
 }
 
 // ── Analysis ──────────────────────────────────────────────────────────────
+let pendingAnalysis = null;
+let retryTimer = null;
+
 async function runAnalysis() {
   const hid = +document.getElementById('homeSel').value;
   const aid = +document.getElementById('awaySel').value;
   const cid = +document.getElementById('compSel').value;
+  pendingAnalysis = {hid, aid, cid};
+  await doAnalysis(hid, aid, cid);
+}
+
+async function doAnalysis(hid, aid, cid) {
+  // Check rate limit first
+  const rlRes = await fetch('/api/rate-status').catch(() => null);
+  if (rlRes) {
+    const rl = await rlRes.json();
+    if (rl.limited || rl.remaining <= 1) {
+      showRateLimitWait(rl.reset_in);
+      return;
+    }
+  }
 
   document.getElementById('loading').classList.add('show');
   document.getElementById('results').classList.remove('show');
   document.getElementById('errBox').classList.remove('show');
 
-  // Animate loading steps
   const steps = ['ls1','ls2','ls3','ls4'];
-  steps.forEach((s,i) => {
-    setTimeout(() => document.getElementById(s).classList.add('active'), i * 700);
-  });
+  steps.forEach((s,i) => setTimeout(() => document.getElementById(s).classList.add('active'), i*600));
 
   try {
     const res = await fetch('/api/analyze', {
@@ -749,12 +763,52 @@ async function runAnalysis() {
     const data = await res.json();
     document.getElementById('loading').classList.remove('show');
     steps.forEach(s => document.getElementById(s).classList.remove('active'));
+
+    if (data.error && data.error.toLowerCase().includes('rate')) {
+      // Rate limited mid-request — auto retry after cooldown
+      showRateLimitWait(62);
+      return;
+    }
     if (data.error) { showErr(data.error); return; }
     render(data);
+    fetchRateStatus();
   } catch(e) {
     document.getElementById('loading').classList.remove('show');
     showErr('Request failed: ' + e.message);
   }
+}
+
+function showRateLimitWait(seconds) {
+  if (retryTimer) clearInterval(retryTimer);
+  document.getElementById('loading').classList.remove('show');
+  let secs = seconds || 62;
+  const errBox = document.getElementById('errBox');
+  
+  const update = () => {
+    errBox.innerHTML = `⏳ API rate limit reached — auto-retrying in <strong>${secs}s</strong>. The free tier allows 10 requests/minute.`;
+    errBox.classList.add('show');
+    errBox.style.color = 'var(--amber)';
+    errBox.style.borderColor = 'rgba(255,171,0,.3)';
+    errBox.style.background = 'rgba(255,171,0,.08)';
+  };
+  update();
+
+  retryTimer = setInterval(() => {
+    secs--;
+    if (secs <= 0) {
+      clearInterval(retryTimer);
+      errBox.classList.remove('show');
+      errBox.style.color = '';
+      errBox.style.borderColor = '';
+      errBox.style.background = '';
+      if (pendingAnalysis) {
+        const {hid, aid, cid} = pendingAnalysis;
+        doAnalysis(hid, aid, cid);
+      }
+    } else {
+      update();
+    }
+  }, 1000);
 }
 
 function showErr(msg) {
