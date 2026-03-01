@@ -28,7 +28,7 @@ API_KEY_FILE = 'api_key.txt'
 
 # ─── In-memory cache (survives within a single server session) ───────────────
 _cache = {}
-CACHE_TTL = 3600  # 1 hour
+CACHE_TTL = 86400  # 24 hours — finished match data never changes
 
 # ─── Rate limit tracker ───────────────────────────────────────────────────────
 _rate = {
@@ -210,6 +210,144 @@ def get_teams(comp_id):
                'crest': t.get('crest','')} for t in data.get('teams', [])]
     return jsonify(sorted(teams, key=lambda x: x['name']))
 
+@app.route('/api/analyze/stream', methods=['POST'])
+def analyze_stream():
+    """SSE endpoint that streams progress updates then delivers the final result."""
+    from flask import Response, stream_with_context
+    import traceback, json as _json
+
+    d = request.json or {}
+    home_id = d.get('home_team_id')
+    away_id = d.get('away_team_id')
+    comp_id = d.get('competition_id')
+
+    def generate():
+        def send(step, status, msg, sub='', pct=0):
+            payload = _json.dumps({'step': step, 'status': status, 'msg': msg, 'sub': sub, 'pct': pct})
+            yield f'data: {payload}\n\n'
+
+        try:
+            key = get_api_key()
+            if not key:
+                yield from send('error','error','No API key set',pct=0)
+                return
+
+            yield from send('comp','active','Resolving competition…','Looking up competition code',pct=5)
+            comp_code = get_comp_code(comp_id, key)
+
+            yield from send('comp','done',f'Competition ready ({comp_code or comp_id})','',pct=10)
+            yield from send('home','active','Fetching home team matches…','Downloading last 40 finished matches',pct=15)
+
+            home_data = collect_team_data_streamed(home_id, comp_id, comp_code, key,
+                lambda msg, sub, pct: (send('home', 'active', msg, sub, pct)))
+
+            if isinstance(home_data, dict) and 'error' in home_data:
+                yield from send('home','error', home_data['error'], pct=30)
+                yield f'data: {_json.dumps({"error": home_data["error"]})}\n\n'
+                return
+
+            yield from send('home','done',f'Home team: {home_data.get("short_name","?")} — {home_data.get("matches_analyzed",0)} matches analysed','',pct=40)
+            yield from send('away','active','Fetching away team matches…','Downloading last 40 finished matches',pct=45)
+
+            away_data = collect_team_data_streamed(away_id, comp_id, comp_code, key,
+                lambda msg, sub, pct: (send('away', 'active', msg, sub, pct)))
+
+            if isinstance(away_data, dict) and 'error' in away_data:
+                yield from send('away','error', away_data['error'], pct=60)
+                yield f'data: {_json.dumps({"error": away_data["error"]})}\n\n'
+                return
+
+            yield from send('away','done',f'Away team: {away_data.get("short_name","?")} — {away_data.get("matches_analyzed",0)} matches analysed','',pct=65)
+            yield from send('h2h','active','Fetching head-to-head history…','',pct=68)
+
+            h2h = get_head_to_head(home_id, away_id, key)
+            h2h_msg = f'{h2h.get("total",0)} historical meetings found' if h2h.get("total") else 'No H2H history found'
+            yield from send('h2h','done', h2h_msg,'',pct=75)
+            yield from send('standings','active','Fetching league standings…','',pct=78)
+
+            standings = get_standings(comp_id, key)
+            yield from send('standings','done','League table loaded','',pct=83)
+            yield from send('models','active','Running 8 statistical models…','Dixon-Coles · Elo · Momentum · Venue Split · Defensive · Pressure · Goal Expectation · H2H',pct=88)
+
+            result = build_analysis(home_data, away_data, h2h, standings)
+            yield from send('models','done','All models complete — ensemble calculated','',pct=98)
+
+            yield f'data: {_json.dumps({"result": result})}\n\n'
+
+        except Exception as e:
+            app.logger.error(f'Stream error: {traceback.format_exc()}')
+            yield f'data: {_json.dumps({"error": str(e)})}\n\n'
+
+    return Response(stream_with_context(generate()), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+def collect_team_data_streamed(team_id, comp_id, comp_code, key, progress_cb):
+    """Same as collect_team_data but accepts a progress callback."""
+    app.logger.info(f'Fetching matches for team {team_id}')
+
+    matches_raw = fd(f'teams/{team_id}/matches', key, {'status': 'FINISHED', 'limit': 40})
+    all_matches2 = (matches_raw or {}).get('matches') or []
+
+    comp_filtered = [m for m in all_matches2
+        if (str((m.get('competition') or {}).get('id', '')) == str(comp_id) or
+            (comp_code and (m.get('competition') or {}).get('code', '') == comp_code))
+        and (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
+
+    if len(comp_filtered) >= 3:
+        all_matches = comp_filtered
+    elif all_matches2:
+        all_matches = [m for m in all_matches2
+            if (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
+    else:
+        all_matches = []
+
+    if not all_matches:
+        return {'error': f'No match data for team {team_id}. Possible rate limit — wait 60s and retry.'}
+
+    matches = all_matches[-10:]
+    if len(matches) < 3:
+        return {'error': f'Only {len(matches)} finished matches for team {team_id}. Need at least 3.'}
+
+    # Enrich with match details
+    enriched = []
+    total = len(matches)
+    cached_count = 0
+    for i, m in enumerate(matches):
+        cache_key = f'matches/{m["id"]}_None'
+        cached = cache_get(cache_key)
+        if cached:
+            enriched.append(cached)
+            cached_count += 1
+        else:
+            detail = fd(f'matches/{m["id"]}', key, use_cache=True)
+            enriched.append(detail if detail else m)
+
+    src = f'{cached_count} cached, {total-cached_count} fresh'
+    app.logger.info(f'Enriched {total} matches ({src})')
+
+    team_name, short_name = '', ''
+    for m in enriched:
+        ht = (m.get('homeTeam') or {})
+        at = (m.get('awayTeam') or {})
+        if ht.get('id') == team_id:
+            team_name = ht.get('name', '')
+            short_name = ht.get('shortName', team_name)
+            break
+        elif at.get('id') == team_id:
+            team_name = at.get('name', '')
+            short_name = at.get('shortName', team_name)
+            break
+
+    try:
+        result = parse_team_stats(team_id, enriched, team_name, short_name)
+        return result or {'error': f'Failed to parse stats for team {team_id}'}
+    except Exception as e:
+        import traceback
+        app.logger.error(f'parse_team_stats error: {traceback.format_exc()}')
+        return {'error': f'Stats parsing failed: {str(e)}'}
+
+
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
     import traceback
@@ -267,32 +405,27 @@ def collect_team_data(team_id, comp_id, key):
     comp_code = get_comp_code(comp_id, key)
     app.logger.info(f'Competition code resolved: {comp_code}')
 
-    # Strategy 1: filter by competition CODE
-    params = {'status': 'FINISHED', 'limit': 15}
-    if comp_code:
-        params['competitions'] = comp_code
-    matches_raw = fd(f'teams/{team_id}/matches', key, params)
-    all_matches = (matches_raw or {}).get('matches') or []
-    app.logger.info(f'Strategy 1 (code={comp_code}): {len(all_matches)} matches')
+    # Single fetch with high limit — filter locally (saves 1 API call vs two-strategy approach)
+    matches_raw = fd(f'teams/{team_id}/matches', key, {'status': 'FINISHED', 'limit': 40})
+    all_matches2 = (matches_raw or {}).get('matches') or []
+    app.logger.info(f'Fetched {len(all_matches2)} matches for team {team_id}')
 
-    # Strategy 2: unfiltered, filter locally
-    if len(all_matches) < 3:
-        matches_raw2 = fd(f'teams/{team_id}/matches', key, {'status': 'FINISHED', 'limit': 40})
-        all_matches2 = (matches_raw2 or {}).get('matches') or []
-        app.logger.info(f'Strategy 2 (unfiltered): {len(all_matches2)} matches')
+    # Filter to selected competition by code or id
+    comp_filtered = [m for m in all_matches2
+        if (str((m.get('competition') or {}).get('id', '')) == str(comp_id) or
+            (comp_code and (m.get('competition') or {}).get('code', '') == comp_code))
+        and (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
+    app.logger.info(f'Competition-filtered: {len(comp_filtered)} matches')
 
-        comp_filtered = [m for m in all_matches2
-            if (str((m.get('competition') or {}).get('id', '')) == str(comp_id) or
-                (m.get('competition') or {}).get('code', '') == comp_code)
-            and (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
-        app.logger.info(f'Strategy 2 comp-filtered: {len(comp_filtered)} matches')
-
-        if len(comp_filtered) >= 3:
-            all_matches = comp_filtered
-        elif all_matches2:
-            all_matches = [m for m in all_matches2
-                if (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
-            app.logger.warning(f'Cross-comp fallback: {len(all_matches)} matches')
+    if len(comp_filtered) >= 3:
+        all_matches = comp_filtered
+    elif all_matches2:
+        # Last resort — use all finished matches
+        all_matches = [m for m in all_matches2
+            if (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
+        app.logger.warning(f'Cross-comp fallback: {len(all_matches)} matches')
+    else:
+        all_matches = []
 
     if not all_matches:
         return {'error': f'No match data for team {team_id}. Possible rate limit — wait 60s and retry.'}
@@ -304,16 +437,21 @@ def collect_team_data(team_id, comp_id, key):
     if len(matches) < 3:
         return {'error': f'Only {len(matches)} finished matches found for team {team_id}. Need at least 3.'}
     # Enrich with detailed match data (lineup + stats per match)
-    # Uses cache so repeated analyses don't re-fetch the same matches
+    # Cache TTL=24h so finished match data is fetched once and reused forever
     enriched = []
+    fetched = 0
     for m in matches:
-        detail = fd(f'matches/{m["id"]}', key, use_cache=True)
-        if detail:
-            enriched.append(detail)
+        cache_key = f'matches/{m["id"]}_None'  # matches fd() cache key format
+        if cache_get(cache_key) is not None:
+            # Already cached — free
+            detail = cache_get(cache_key)
         else:
-            app.logger.warning(f'Using basic data for match {m["id"]}')
-            enriched.append(m)
-        # No sleep — cache prevents redundant calls, rate limit handled by fd()
+            # Only fetch if not cached — count these as they cost rate limit
+            detail = fd(f'matches/{m["id"]}', key, use_cache=True)
+            if detail:
+                fetched += 1
+        enriched.append(detail if detail else m)
+    app.logger.info(f'Enriched {len(enriched)} matches ({fetched} fresh API calls, {len(enriched)-fetched} cached)')
 
     # Get team name from matches
     team_name = ''
