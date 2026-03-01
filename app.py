@@ -56,11 +56,8 @@ def fd(endpoint, api_key, params=None, retries=2):
             if r.status_code == 200:
                 return r.json()
             elif r.status_code == 429:
-                wait = int(r.headers.get('X-RequestCounter-Reset', 60))
-                app.logger.warning(f'Rate limited on {endpoint}, waiting {wait}s (attempt {attempt+1})')
-                if attempt < retries:
-                    time.sleep(min(wait, 65))
-                    continue
+                app.logger.warning(f'Rate limited on {endpoint} (attempt {attempt+1}) — skipping')
+                # Never block the worker waiting for rate limit reset
                 return None
             elif r.status_code == 403:
                 app.logger.error(f'403 on {endpoint}: not available on your API tier')
@@ -235,11 +232,25 @@ def collect_team_data(team_id, comp_id, key):
         return {'error': f'Not enough finished matches for team {team_id} (found {len(matches)}). Your API tier may not support this competition. Try: Premier League, Bundesliga, La Liga, Serie A, Ligue 1, or Champions League.'}
 
     # Enrich with detailed match data (lineup + stats per match)
+    # Use a short delay between calls to avoid hitting the 10 req/min free tier limit
     enriched = []
     for m in matches:
-        detail = fd(f'matches/{m["id"]}', key)
-        enriched.append(detail if detail else m)
-        time.sleep(0.1)  # avoid rate limiting
+        time.sleep(0.7)  # ~8 requests/min safely under the 10/min limit
+        try:
+            r = requests.get(
+                f'https://api.football-data.org/v4/matches/{m["id"]}',
+                headers={'X-Auth-Token': key},
+                timeout=10
+            )
+            if r.status_code == 200:
+                enriched.append(r.json())
+            else:
+                # Rate limited or error — just use basic match data, don't block
+                app.logger.warning(f'Skipping detail for match {m["id"]}: {r.status_code}')
+                enriched.append(m)
+        except Exception as e:
+            app.logger.warning(f'Detail fetch failed for match {m["id"]}: {e}')
+            enriched.append(m)
 
     # Get team name from matches
     team_name = ''
@@ -256,7 +267,15 @@ def collect_team_data(team_id, comp_id, key):
             short_name = at.get('shortName', team_name)
             break
 
-    return parse_team_stats(team_id, enriched, team_name, short_name)
+    try:
+        result = parse_team_stats(team_id, enriched, team_name, short_name)
+        if result is None:
+            return {'error': f'Failed to parse stats for team {team_id}'}
+        return result
+    except Exception as e:
+        import traceback
+        app.logger.error(f'parse_team_stats error: {traceback.format_exc()}')
+        return {'error': f'Stats parsing failed for team {team_id}: {str(e)}'}
 
 
 def parse_team_stats(team_id, matches, team_name, short_name):
