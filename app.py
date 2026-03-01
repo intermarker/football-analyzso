@@ -198,38 +198,46 @@ def collect_team_data(team_id, comp_id, key):
     """Fetch last 10 league matches with full stats + lineups."""
     import time
 
-    # Try with competition filter first
+    app.logger.info(f'Fetching matches for team {team_id} in comp {comp_id}')
+
+    # Strategy 1: filtered by competition
     matches_raw = fd(f'teams/{team_id}/matches', key, {
         'competitions': comp_id, 'status': 'FINISHED', 'limit': 15
     })
+    all_matches = (matches_raw or {}).get('matches') or []
+    app.logger.info(f'Strategy 1 (filtered): got {len(all_matches)} matches')
 
-    # Fallback: fetch without competition filter (works on free tier)
-    if not matches_raw:
-        app.logger.warning(f'Filtered fetch failed for team {team_id}, trying unfiltered')
-        matches_raw = fd(f'teams/{team_id}/matches', key, {
-            'status': 'FINISHED', 'limit': 20
+    # Strategy 2: no competition filter, higher limit
+    if len(all_matches) < 3:
+        app.logger.warning(f'Strategy 1 got {len(all_matches)} — trying unfiltered')
+        matches_raw2 = fd(f'teams/{team_id}/matches', key, {
+            'status': 'FINISHED', 'limit': 30
         })
+        all_matches2 = (matches_raw2 or {}).get('matches') or []
+        app.logger.info(f'Strategy 2 (unfiltered): got {len(all_matches2)} matches')
+        # Filter locally by competition id
+        comp_filtered = [m for m in all_matches2
+                         if str((m.get('competition') or {}).get('id', '')) == str(comp_id)
+                         and (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
+        app.logger.info(f'Strategy 2 comp-filtered: {len(comp_filtered)} matches')
+        if len(comp_filtered) >= 3:
+            all_matches = comp_filtered
+        elif len(all_matches2) >= 3:
+            # Use all finished matches regardless of competition as last resort
+            all_matches = [m for m in all_matches2
+                           if (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
+            app.logger.warning(f'Using cross-competition fallback: {len(all_matches)} matches')
 
-    if not matches_raw:
-        return {'error': f'Cannot fetch matches for team {team_id}. This competition may not be available on your API tier. Supported competitions: Premier League, Bundesliga, La Liga, Serie A, Ligue 1, Champions League, Eredivisie, Primeira Liga.'}
+    if not all_matches:
+        return {'error': f'Cannot fetch any matches for team {team_id}. The API returned no data. This may be a rate limit — wait 60 seconds and try again.'}
 
-    all_matches = matches_raw.get('matches', [])
-
-    # Filter to selected competition first
-    comp_matches = [m for m in all_matches
-                    if str(m.get('competition', {}).get('id', '')) == str(comp_id)
-                    and m.get('score', {}).get('fullTime', {}).get('home') is not None]
-
-    # Use competition matches if enough, otherwise use all finished
-    if len(comp_matches) >= 3:
-        matches = comp_matches[-10:]
-    else:
-        matches = [m for m in all_matches
-                   if m.get('score', {}).get('fullTime', {}).get('home') is not None][-10:]
+    # Filter to finished matches with scores
+    finished = [m for m in all_matches
+                if (m.get('score') or {}).get('fullTime', {}).get('home') is not None]
+    matches = finished[-10:]
 
     if len(matches) < 3:
-        comp_name = all_matches[0].get('competition', {}).get('name', 'unknown') if all_matches else 'unknown'
-        return {'error': f'Not enough finished matches for team {team_id} (found {len(matches)}). Your API tier may not support this competition. Try: Premier League, Bundesliga, La Liga, Serie A, Ligue 1, or Champions League.'}
+        return {'error': f'Only {len(matches)} finished matches found for team {team_id}. Need at least 3 to run analysis.'}
 
     # Enrich with detailed match data (lineup + stats per match)
     # Use a short delay between calls to avoid hitting the 10 req/min free tier limit
