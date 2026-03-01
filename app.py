@@ -73,7 +73,13 @@ def index():
 
 @app.route('/api/check-key')
 def check_key():
-    return jsonify({'has_key': bool(get_api_key())})
+    key = get_api_key()
+    return jsonify({
+        'has_key': bool(key),
+        'key_length': len(key) if key else 0,
+        'key_preview': key[:6] + '...' if len(key) > 6 else '(empty)',
+        'source': 'env' if os.environ.get('FOOTBALL_API_KEY') else ('file' if os.path.exists(API_KEY_FILE) else 'none')
+    })
 
 @app.route('/api/save-key', methods=['POST'])
 def save_key():
