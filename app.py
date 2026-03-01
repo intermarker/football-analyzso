@@ -217,6 +217,23 @@ def collect_team_data(team_id, comp_id, key):
         enriched.append(detail if detail else m)
         time.sleep(0.1)  # avoid rate limiting
 
+    # Get team name from matches
+    team_name = ''
+    short_name = ''
+    for m in enriched:
+        ht = (m.get('homeTeam') or {})
+        at = (m.get('awayTeam') or {})
+        if ht.get('id') == team_id:
+            team_name = ht.get('name', '')
+            short_name = ht.get('shortName', team_name)
+            break
+        elif at.get('id') == team_id:
+            team_name = at.get('name', '')
+            short_name = at.get('shortName', team_name)
+            break
+
+    return parse_team_stats(team_id, enriched, team_name, short_name)
+
 
 def parse_team_stats(team_id, matches, team_name, short_name):
     """Extract comprehensive stats from enriched match list."""
